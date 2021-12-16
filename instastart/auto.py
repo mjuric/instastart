@@ -5,6 +5,7 @@
 #  * Tests
 #
 import socket, os, sys, marshal, tty, fcntl, termios, select, signal
+from contextlib import contextmanager
 
 # Helpful constants
 STDIN  = 0
@@ -89,9 +90,8 @@ def _writen(fd, data):
 #############################################################################
 
 class Server:
-    # the pipe that .start() uses to signal the server is ready
-    _readypipe = None
-    socket_path = None
+    _readypipe = None   # the pipe that .start() uses to signal the server is ready
+    socket_path = None  # path to the UNIX socket we listen on
 
     def __init__(self, socket_path) -> None:
         self.socket_path = socket_path
@@ -126,14 +126,14 @@ class Server:
         else:
             os.close(_w)
             # parent -- we'll wait for the server to become available, then connect to it.
-    #        print(f"Awaiting a signal at {socket_path=}")
+            # print(f"Awaiting a signal at {socket_path=}")
             while True:
                 msg = os.read(_r, 1)
-    #            debug(msg)
+                # debug(msg)
                 if len(msg):
                     break
             os.close(_r)
-    #        print(f"Signal received!")
+            # print(f"Signal received!")
         return pid
 
     def _serve(self, timeout):
@@ -154,22 +154,22 @@ class Server:
         import atexit
         atexit.register(self._unlink_socket)
 
-    #    debug(f"Opening socket at {socket_path=} with {timeout=}...", end='')
+        # debug(f"Opening socket at {socket_path=} with {timeout=}...", end='')
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(timeout)
             os.fchmod(sock.fileno(), 0o700)		# security: only allow the user to do anything w. the socket
             sock.bind(spath)
             sock.listen()
             os.rename(spath, self.socket_path)
-    #        debug(' done.')
+            # debug(' done.')
 
             if self._readypipe is not None:
-    #            debug('signaling on readypipe')
+                # debug('signaling on readypipe')
                 # signal to the reader the server is ready to accept connections
                 os.write(self._readypipe, b"x")
                 os.close(self._readypipe)
                 self._readypipe = None
-    #            debug('done')
+                # debug('done')
 
             # Await for client connections (or server commands)
             while True:
@@ -178,13 +178,13 @@ class Server:
                 except socket.timeout:
                     debug("Server timeout. Exiting")
                     sys.exit(0)
-    #            debug(f"Connection accepted")
+                # debug(f"Connection accepted")
 
                 # make our life easier & create a file-like object
                 fp = conn.makefile(mode='rwb', buffering=0)
 
                 cmd = _read_object(fp)
-    #            debug(f"{cmd=}")
+                # debug(f"{cmd=}")
                 if cmd == "stop":
                     # exit the listen loop
                     debug("Server received a command to exit. Exiting")
@@ -206,7 +206,7 @@ class Server:
 
     def start(self, timeout):
         # run the server. Returns only in the forked worker process.
-    #    print("Spinning up the server... {_w=}")
+        # print("Spinning up the server... {_w=}")
         return self._serve(timeout=timeout)
 
 #############################################################################
@@ -265,14 +265,14 @@ class Worker:
 
         # File descriptors that we should directly duplicate (w. dup2)
         fdidx = _read_object(fp) # a list of one or more of [STDIN, STDOUT, STDERR]
-    #    debug(f"{fdidx=}")
+        # debug(f"{fdidx=}")
         if len(fdidx):
             _, fds, _, _ = socket.recv_fds(conn, 10, maxfds=len(fdidx))
         else:
             fds = []
-    #    debug(f"{fds=}")
+        # debug(f"{fds=}")
         for a, b in zip(fds, fdidx):
-    #        debug(f"_spawn: duplicating fd {a} to {b}")
+            # debug(f"_spawn: duplicating fd {a} to {b}")
             os.dup2(a, b)
 
         # receive the client PID (FIXME: we don't really use this)
@@ -349,10 +349,10 @@ class Worker:
             #        constantly listen on conn?
             #        Actually, we should do this: https://docs.python.org/3/library/signal.html#signal.set_wakeup_fd
             while True:
-    #            debug(f"SENTRY: waitpid on {pid=}")
+                # debug(f"SENTRY: waitpid on {pid=}")
                 _, status = os.waitpid(pid, os.WUNTRACED | os.WCONTINUED)
-    #            debug(f"SENTRY: waitpid returned {status=}")
-    #            debug(f"SENTRY: {os.WIFSTOPPED(status)=} {os.WIFEXITED(status)=} {os.WIFSIGNALED(status)=} {os.WIFCONTINUED(status)=}")
+                # debug(f"SENTRY: waitpid returned {status=}")
+                # debug(f"SENTRY: {os.WIFSTOPPED(status)=} {os.WIFEXITED(status)=} {os.WIFSIGNALED(status)=} {os.WIFCONTINUED(status)=}")
                 if os.WIFSTOPPED(status):
                     # let the controller know we've stopped
                     _write_object(fp, ("stopped", 0))
@@ -397,6 +397,8 @@ class Worker:
 #   https://news.ycombinator.com/item?id=8773740
 #
 class Client:
+    socket_path = None   # path to the UNIX socket we connect to
+
     def __init__(self, socket_path) -> None:
         self.socket_path = socket_path
 
@@ -419,10 +421,10 @@ class Client:
         if master_fd is not None: fds.append(master_fd)
         if tty_fd is not None: fds.append(tty_fd)
         import time
-    #    debug(f"{fds=} {master_fd=} {tty_fd=}")
+        # debug(f"{fds=} {master_fd=} {tty_fd=}")
         while fds:
             rfds, _wfds, _xfds = select.select(fds, [], [])
-    #        debug(f"{rfds=} {time.time()=}")
+            # debug(f"{rfds=} {time.time()=}")
 
             # received output
             if master_fd in rfds:
@@ -433,7 +435,7 @@ class Client:
                 except OSError:
                     data = b""
                 if not data:  # Reached EOF.
-    #                debug("CLIENT: zero read on master_fd")
+                    # debug("CLIENT: zero read on master_fd")
                     fds.remove(master_fd)
                 else:
                     os.write(tty_fd, data)
@@ -451,7 +453,7 @@ class Client:
                 # a control message from the worker. they've
                 # paused, exited, etc.
                 event, data = _read_object(control_fp)
-    #            debug(f"CLIENT: received {event=}")
+                # debug(f"CLIENT: received {event=}")
                 if event == "stopped":
                     if tty_fd is not None:
                         # it's possible we've been backrounded by the time we got here,
@@ -460,15 +462,15 @@ class Client:
                         signal.signal(signal.SIGTTOU, signal.SIG_IGN)
                         termios.tcsetattr(tty_fd, tty.TCSAFLUSH, termios_attr)	# restore tty
                         signal.signal(signal.SIGTTOU, signal.SIG_DFL)
-    #                    debug("CLIENT: Putting us to sleep")
-    #                    os.kill(os.getpid(), signal.SIGSTOP)			# put ourselves to sleep
+                        # debug("CLIENT: Putting us to sleep")
+                        # os.kill(os.getpid(), signal.SIGSTOP)			# put ourselves to sleep
                     os.kill(0, signal.SIGSTOP)			# put ourselves to sleep
 
                     # this is where we sleep....
                     # ... and continue when we're awoken by SIGCONT (e.g., 'fg' in the shell)
 
                     if tty_fd is not None:
-    # 	             debug("CLIENT: Awake again")
+     	                # debug("CLIENT: Awake again")
                         tty.setraw(tty_fd)					# turn the STDIN raw again
 
                         # set terminal size (in case it changed while we slept)
@@ -480,7 +482,6 @@ class Client:
                 elif event == "exited":
                     return data # data is the exitstatus
                 elif event == "signaled":
-    #                return -1
                     signum = data  # data is the signal that terminated the worker
                     if tty_fd is not None:
                         termios.tcsetattr(tty_fd, tty.TCSAFLUSH, termios_attr)	# restore tty back from the raw mode
@@ -499,7 +500,7 @@ class Client:
             # the control socket (and can do the same).
             #
             # FIXME: this signaling should be done through the control socket (pid race contitions!)
-    #        debug(f"_handle_ISIG: {signum=}")
+            # debug(f"_handle_ISIG: {signum=}")
             os.killpg(os.getpgid(remote_pid), signum)
 
         # forward all signals that make sense to forward
@@ -510,8 +511,6 @@ class Client:
     def connect(self):
         # try connecting to the UNIX socket. If successful, pass it our command
         # line (argv).  If connection is not successful, start the server.
-    #    if not os.path.exists(socket_path):
-    #        return _server(preload, payload, timeout)
 
         # try connecting
         try:
@@ -551,11 +550,11 @@ class Client:
                 pipes.append(fd)
             elif tty_fd is None:
                 ttyname = os.ttyname(fd)
-    #            debug(f"{ttyname=}")
+                # debug(f"{ttyname=}")
                 tty_fd = os.open(ttyname, os.O_RDWR)
 
-    #    debug(f"Non-tty {pipes=}")
-    #    debug(f"{tty_fd=}")
+        # debug(f"Non-tty {pipes=}")
+        # debug(f"{tty_fd=}")
         _write_object(fp, pipes)
         if len(pipes):
             socket.send_fds(client, [ b'm' ], pipes)
@@ -626,7 +625,6 @@ def done(exitcode=0):
     # May only be called from the worker (i.e., after start() has been called).
     worker.done(exitcode)
 
-from contextlib import contextmanager
 @contextmanager
 def serve(autodone=True):
     # Convenience function to wrap a block of code in a context manager
