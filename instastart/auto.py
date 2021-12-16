@@ -194,75 +194,6 @@ def _spawn(conn, fp):
         if havetty: os.close(slave_fd)
         conn.close()
 
-def _unlink_socket():
-    # atexit handler registered by _server
-    if os.path.exists(socket_path):
-        os.unlink(socket_path)
-
-def _server(timeout=None, readypipe=None):
-    # Execute preload code
-##    exec(preload)
-
-    # avoid the race condition where two programs are launched
-    # at the same time, and try to create the same socket. We'll create
-    # our socket in {socket_path}.{pid}, then mv to {socket_path}.
-    # that way, the last process wins.
-    pid = os.getpid()
-    spath = f"{socket_path}.{pid}"
-    if os.path.exists(spath):
-        os.unlink(spath)
-
-    import atexit
-    atexit.register(_unlink_socket)
-
-#    debug(f"Opening socket at {socket_path=} with {timeout=}...", end='')
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.settimeout(timeout)
-        os.fchmod(sock.fileno(), 0o700)		# security: only allow the user to do anything w. the socket
-        sock.bind(spath)
-        sock.listen()
-        os.rename(spath, socket_path)
-#        debug(' done.')
-
-        if readypipe is not None:
-#            debug('signaling on readypipe')
-            # signal to the reader the server is ready to accept connections
-            os.write(readypipe, b"x")
-            os.close(readypipe)
-#            debug('done')
-
-        # Await for client connections (or server commands)
-        while True:
-            try:
-                conn, _ = sock.accept()
-            except socket.timeout:
-                debug("Server timeout. Exiting")
-                sys.exit(0)
-#            debug(f"Connection accepted")
-
-            # make our life easier & create a file-like object
-            fp = conn.makefile(mode='rwb', buffering=0)
-
-            cmd = _read_object(fp)
-#            debug(f"{cmd=}")
-            if cmd == "stop":
-                # exit the listen loop
-                debug("Server received a command to exit. Exiting")
-                sys.exit(0)
-            elif cmd == "run":
-                # Fork a child process to do the work.
-                pid = os.fork()
-                if pid == 0:
-                    # Child process -- this is where the work gets done
-                    atexit.unregister(_unlink_socket)
-                    sock.close()
-                    return _spawn(conn, fp)
-                else:
-                    conn.close()
-
-    # This function will continue _only_ in the spawned child process,
-    # and execute the main program.
-
 #############################################################################
 #
 #   Control socket communication routines
@@ -551,12 +482,6 @@ def serve():
 #        else:
 #            done(1)
 
-def start():
-    # run the server
-#    print("Spinning up the server... {_w=}")
-    timeout = os.environ.get("INSTA_TIMEOUT", 10)
-    _server(timeout=timeout, readypipe=_w)
-
 def done(exitcode=0):
     # Flush the output back to the client
     if not sys.stdout.closed: sys.stdout.flush()
@@ -571,40 +496,126 @@ def done(exitcode=0):
     global _client_fp
     _write_object(_client_fp, ("exited", exitcode))
 
-def _fork_and_wait_for_server():
-    global _w
-    _r, _w = os.pipe()
-    pid = os.fork()
-    if pid == 0:
-        os.close(_r)
-        import setproctitle
-        name = sys.argv[0].split('/')[-1]
-        setproctitle.setproctitle(f"[instastart: {name}]")
+def _unlink_socket():
+    # atexit handler registered by _server
+    if os.path.exists(socket_path):
+        os.unlink(socket_path)
 
-        # child -- this is what will become the server. Just fall through
-        # the code, to be caught in start(). This will launch the
-        # server, setting up its socket, etc., and signaling we're ready by
-        # writing to _r pipe.
+class Server:
+    # the pipe that .start() uses to signal the server is ready
+    _readypipe = None
 
-        # start a new session, to protect the child from SIGHUPs, etc.
-        # we don't double-fork as the daemon never really does anything
-        # funny with the tty (TODO: should we still double-fork, just in case?)
-        os.setsid()
+    def fork_and_wait_for_server(self):
+        _r, _w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(_r)
+            import setproctitle
+            name = sys.argv[0].split('/')[-1]
+            setproctitle.setproctitle(f"[instastart: {name}]")
 
-        # now fall through until we hit start() somewhere in __main__
-        pass
-    else:
-        os.close(_w)
-        # parent -- we'll wait for the server to become available, then connect to it.
-#        print(f"Awaiting a signal at {socket_path=}")
-        while True:
-            msg = os.read(_r, 1)
-#            debug(msg)
-            if len(msg):
-                break
-        os.close(_r)
-#        print(f"Signal received!")
-    return pid
+            # child -- this is what will become the server. Just fall through
+            # the code, to be caught in start(). This will launch the
+            # server, setting up its socket, etc., and signaling we're ready by
+            # writing to _r pipe.
+
+            # start a new session, to protect the child from SIGHUPs, etc.
+            # we don't double-fork as the daemon never really does anything
+            # funny with the tty (TODO: should we still double-fork, just in case?)
+            os.setsid()
+
+            # now fall through until we hit start() somewhere in __main__
+            self._readypipe = _w
+            pass
+        else:
+            os.close(_w)
+            # parent -- we'll wait for the server to become available, then connect to it.
+    #        print(f"Awaiting a signal at {socket_path=}")
+            while True:
+                msg = os.read(_r, 1)
+    #            debug(msg)
+                if len(msg):
+                    break
+            os.close(_r)
+    #        print(f"Signal received!")
+        return pid
+
+    def _serve(self, timeout):
+        # this is invoked by start(), at a point where user's one-time
+        # (heavy) initialization has completed. We'll pause execution,
+        # daemonize, and start waiting for incoming connections to fork off
+        # children (workers) to continue doing the work.
+
+        # safely set up a socket on which to listen for connections.
+        # avoid the race condition where two clients are launched
+        # at the same time, and try to create the same socket.
+        pid = os.getpid()
+        spath = f"{socket_path}.{pid}"
+        if os.path.exists(spath):
+            os.unlink(spath)
+
+        # make sure we clean up if anything goes wrong
+        import atexit
+        atexit.register(_unlink_socket)
+
+    #    debug(f"Opening socket at {socket_path=} with {timeout=}...", end='')
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            os.fchmod(sock.fileno(), 0o700)		# security: only allow the user to do anything w. the socket
+            sock.bind(spath)
+            sock.listen()
+            os.rename(spath, socket_path)
+    #        debug(' done.')
+
+            if self._readypipe is not None:
+    #            debug('signaling on readypipe')
+                # signal to the reader the server is ready to accept connections
+                os.write(self._readypipe, b"x")
+                os.close(self._readypipe)
+                self._readypipe = None
+    #            debug('done')
+
+            # Await for client connections (or server commands)
+            while True:
+                try:
+                    conn, _ = sock.accept()
+                except socket.timeout:
+                    debug("Server timeout. Exiting")
+                    sys.exit(0)
+    #            debug(f"Connection accepted")
+
+                # make our life easier & create a file-like object
+                fp = conn.makefile(mode='rwb', buffering=0)
+
+                cmd = _read_object(fp)
+    #            debug(f"{cmd=}")
+                if cmd == "stop":
+                    # exit the listen loop
+                    debug("Server received a command to exit. Exiting")
+                    sys.exit(0)
+                elif cmd == "run":
+                    # Fork a child process to do the work.
+                    pid = os.fork()
+                    if pid == 0:
+                        # Child process -- this is where the work gets done
+                        atexit.unregister(_unlink_socket)
+                        sock.close()
+                        return _spawn(conn, fp)
+                    else:
+                        conn.close()
+
+        # This function will continue _only_ in the spawned child process,
+        # and execute the main program.
+        assert False, "This function should only return in a worker process!"
+
+    def start(self, timeout):
+        # run the server. Returns only in the forked worker process.
+    #    print("Spinning up the server... {_w=}")
+        return self._serve(timeout=timeout)
+
+def start():
+    timeout = os.environ.get("INSTA_TIMEOUT", 10)
+    server.start(timeout=timeout)
 
 def _connect_or_serve():
     # try connecting on our socket; if fail, spawn a new server
@@ -616,7 +627,8 @@ def _connect_or_serve():
 
     # fork the server. This will return pid or 0, depending on if it's
     # child or parent
-    if _fork_and_wait_for_server() != 0:
+    server = Server()
+    if server.fork_and_wait_for_server() != 0:
         # parent (== client)
 
         # try connecting again
@@ -628,6 +640,6 @@ def _connect_or_serve():
     else:
         # this will fall through the code until, running all code that
         # should be prewarmed until it's paused in start()
-        pass
+        return server
 
-_connect_or_serve()
+server = _connect_or_serve()
