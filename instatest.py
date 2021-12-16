@@ -1,4 +1,4 @@
-from instastart.auto import serve
+import instastart.auto
 
 import dask.distributed as dd
 #import astropy
@@ -19,13 +19,13 @@ def run_echo():
         for line in sys.stdin:
             print("ECHO:", line, end='')
         pass
-    except Exception:
+    except Exception as e:
         print("EXCEPTION", e)
         raise
     print("Exiting tqdm_echo")
 
 if __name__ == "__main__":
-    with serve():
+    with instastart.auto.serve():
         print("Here!")
         print(f"{sys.argv=}")
         print(f"{os.getcwd()=}")
