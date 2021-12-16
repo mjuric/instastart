@@ -14,7 +14,6 @@ STDERR = 2
 # These get set in their respective processes. They really shouldn't be
 # touched by user code (an internal implementation detail)
 worker = None
-client = None
 server = None
 
 # construct our unique socket name
@@ -37,8 +36,6 @@ def _construct_socket_name():
     fn = pth.split('/')[-1].split('.')[0]
 
     return os.path.join(os.environ['XDG_RUNTIME_DIR'], f"{fn}.{md5}.socket")
-
-socket_path = _construct_socket_name()
 
 # our own fast-ish logging routines
 # (importing logging seems to add ~15msec to runtime, tested on macOS/MBA)
@@ -267,6 +264,9 @@ def _writen(fd, data):
 #   https://news.ycombinator.com/item?id=8773740
 #
 class Client:
+    def __init__(self, socket_path) -> None:
+        self.socket_path = socket_path
+
     # we need to catch & pass on:
     # INTR, QUIT, SUSP, or DSUSP ==> SIGINT, SIGQUIT, SIGTSTP, SIGTERM
     # and then we need SIGCONT for recovery
@@ -383,7 +383,7 @@ class Client:
         # try connecting
         try:
             client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            client.connect(socket_path)
+            client.connect(self.socket_path)
         except (FileNotFoundError, ConnectionRefusedError):
             # connection failed; return None
             return None
@@ -472,14 +472,18 @@ class Client:
 
         return exitcode
 
-def _unlink_socket():
-    # atexit handler registered by _server
-    if os.path.exists(socket_path):
-        os.unlink(socket_path)
-
 class Server:
     # the pipe that .start() uses to signal the server is ready
     _readypipe = None
+    socket_path = None
+
+    def __init__(self, socket_path) -> None:
+        self.socket_path = socket_path
+
+    def _unlink_socket(self):
+        # atexit handler registered by _server
+        if os.path.exists(self.socket_path):
+            os.unlink(self.socket_path)
 
     def fork_and_wait_for_server(self):
         _r, _w = os.pipe()
@@ -526,13 +530,13 @@ class Server:
         # avoid the race condition where two clients are launched
         # at the same time, and try to create the same socket.
         pid = os.getpid()
-        spath = f"{socket_path}.{pid}"
+        spath = f"{self.socket_path}.{pid}"
         if os.path.exists(spath):
             os.unlink(spath)
 
         # make sure we clean up if anything goes wrong
         import atexit
-        atexit.register(_unlink_socket)
+        atexit.register(self._unlink_socket)
 
     #    debug(f"Opening socket at {socket_path=} with {timeout=}...", end='')
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -540,7 +544,7 @@ class Server:
             os.fchmod(sock.fileno(), 0o700)		# security: only allow the user to do anything w. the socket
             sock.bind(spath)
             sock.listen()
-            os.rename(spath, socket_path)
+            os.rename(spath, self.socket_path)
     #        debug(' done.')
 
             if self._readypipe is not None:
@@ -574,7 +578,7 @@ class Server:
                     pid = os.fork()
                     if pid == 0:
                         # Child process -- this is where the work gets done
-                        atexit.unregister(_unlink_socket)
+                        atexit.unregister(self._unlink_socket)
                         sock.close()
                         return Worker(conn, fp)
                     else:
@@ -626,8 +630,8 @@ def serve(autodone=True):
 
 def _connect_or_serve():
     # try connecting on our socket; if fail, spawn a new server
-    global client
-    client = Client()
+    socket_path = _construct_socket_name()
+    client = Client(socket_path)
 
     # try connecting
     ret = client.connect()
@@ -636,7 +640,7 @@ def _connect_or_serve():
 
     # fork the server. This will return pid or 0, depending on if it's
     # child or parent
-    server = Server()
+    server = Server(socket_path)
     if server.fork_and_wait_for_server() != 0:
         # parent (== client)
 
