@@ -65,134 +65,158 @@ def _setwinsize(fd, winsz):
 #
 #############################################################################
 
-def _spawn(conn, fp):
-    #
-    # Spawn a child to execute the payload. The parent will
-    # stay behind to communicate the child's status to the client.
-    #
+class Worker:
+    _is_worker = False      # set to True in the worker process (false in sentry)
 
-    # receive the command line
-    sys.argv = _read_object(fp)
-    
-    # receive the cwd (and change to it)
-    cwd = _read_object(fp)
-    os.chdir(cwd)
+    def __init__(self, conn, fp):
+        try:
+            self._spawn(conn, fp)
+        finally:
+            # make sure the sentry never returns, even if
+            # we've received an exception or something similar
+            if not self._is_worker:
+                sys.exit(0)
 
-    # receive the environment
-    env = _read_object(fp)
-    os.environ.clear()
-    os.environ.update(env)
+    def _spawn(self, conn, fp):
+        # Fork the sentry and worker processes to execute the payload.
+        #
+        # The sentry is forked first, which then forks the worker. The sentry
+        # plays the role of the shell -- controls the tty session, monitors
+        # worker signals and communicates the exit status to the client.
+        # See docs/implementation.md for details.
+        #
+        # Returns only in the worker process.
 
-    # File descriptors that we should directly dup2-licate
-    fdidx = _read_object(fp) # a list of one or more of [STDIN, STDOUT, STDERR]
-#    debug(f"{fdidx=}")
-    if len(fdidx):
-        _, fds, _, _ = socket.recv_fds(conn, 10, maxfds=len(fdidx))
-    else:
-        fds = []
-#    debug(f"{fds=}")
-    for a, b in zip(fds, fdidx):
-#        debug(f"_spawn: duplicating fd {a} to {b}")
-        os.dup2(a, b)
-
-    # receive the client PID (FIXME: we don't really use this)
-    remote_pid = _read_object(fp)
-
-    havetty = len(fdidx) != 3
-    if havetty:
-        # Open a new PTY and send it back to our ccontroller process
-        master_fd, slave_fd = os.openpty()
-
-        # send back the master_fd, wait for master to set it up and
-        # acknowledge.
-        socket.send_fds(conn, [ b'm' ], [master_fd])
-        ok = _read_object(fp)
-        assert ok == "OK"
-        os.close(master_fd) # master_fd is with the client now, so we can close it
-
-        # make us the session leader, and make slave_fd our 
-        # controlling terminal and dup it to stdin/out/err
-        os.setsid()
-        fcntl.ioctl(slave_fd, termios.TIOCSCTTY)
-
-        # duplicate what's needed
-        if STDERR not in fdidx: os.dup2(slave_fd, STDERR); #debug(f"{(slave_fd, STDERR)=}")
-        if STDIN  not in fdidx: os.dup2(slave_fd, STDIN); #debug(f"{(slave_fd, STDIN)=}")
-        if STDOUT not in fdidx: os.dup2(slave_fd, STDOUT); #debug(f"{(slave_fd, STDOUT)=}")
-
-    # the parent will set up the child's process group and terminal.
-    # while that's going on, the child should wait and not execute
-    # the payload. We do this by having the child wait to receive
-    # a message via a pipe.
-    r, w = os.pipe()
-    
-    # now fork the payload process
-    pid = os.fork()
-    if pid == 0:
-        os.close(w)			# we'll only be reading
-        conn.close()			# we won't be directly communicating to the client
-        if havetty:
-            os.close(slave_fd)		# this has now been duplicated to STD* stream
-        global _client_fp
-        _client_fp = fp
-
-        # wait until the parent sets us up
-        while not len(os.read(r, 1)):
-            pass
-        os.close(r)
-
-        # return to __main__ to run the payload
-        return
-    else:
-        # change name to denote we're the sentry
-        #import setproctitle
-        #setproctitle.setproctitle(f"{' '.join(sys.argv)} [sentry for {pid=}]")
-
-        os.close(r)			# we'll only be writing
+        # receive the command line
+        sys.argv = _read_object(fp)
         
-        os.setpgid(pid, pid)		# start a new process group for the child
+        # receive the cwd (and change to it)
+        cwd = _read_object(fp)
+        os.chdir(cwd)
+
+        # receive the environment
+        env = _read_object(fp)
+        os.environ.clear()
+        os.environ.update(env)
+
+        # File descriptors that we should directly dup2-licate
+        fdidx = _read_object(fp) # a list of one or more of [STDIN, STDOUT, STDERR]
+    #    debug(f"{fdidx=}")
+        if len(fdidx):
+            _, fds, _, _ = socket.recv_fds(conn, 10, maxfds=len(fdidx))
+        else:
+            fds = []
+    #    debug(f"{fds=}")
+        for a, b in zip(fds, fdidx):
+    #        debug(f"_spawn: duplicating fd {a} to {b}")
+            os.dup2(a, b)
+
+        # receive the client PID (FIXME: we don't really use this)
+        remote_pid = _read_object(fp)
+
+        havetty = len(fdidx) != 3
         if havetty:
-            os.tcsetpgrp(slave_fd, pid)	# make the child's the foreground process group (so it receives tty input+signals)
+            # Open a new PTY and send it back to our ccontroller process
+            master_fd, slave_fd = os.openpty()
 
-        _write_object(fp, pid)		# send the child's PID back to the client
+            # send back the master_fd, wait for master to set it up and
+            # acknowledge.
+            socket.send_fds(conn, [ b'm' ], [master_fd])
+            ok = _read_object(fp)
+            assert ok == "OK"
+            os.close(master_fd) # master_fd is with the client now, so we can close it
 
-        os.write(w, b"x")		# unblock the child, close the pipe
-        os.close(w)
+            # make us the session leader, and make slave_fd our 
+            # controlling terminal and dup it to stdin/out/err
+            os.setsid()
+            fcntl.ioctl(slave_fd, termios.TIOCSCTTY)
 
-        # Loop here calling waitpid(-1, 0, WUNTRACED) to handle
-        # the child's SIGSTOP (by SIGSTOP-ing the remote_pid) and death (just exit)
-        # Really good explanation: https://stackoverflow.com/a/34845669
-        # FIXME: We should handle the case where remote_pid is killed, by
-        #        periodically timing out and checking if conn is still open...
-        #        Or, we could move all this into a SIGCHLD handler, and
-        #        constantly listen on conn?
-        #        Actually, we should do this: https://docs.python.org/3/library/signal.html#signal.set_wakeup_fd
-        while True:
-#            debug(f"SENTRY: waitpid on {pid=}")
-            _, status = os.waitpid(pid, os.WUNTRACED | os.WCONTINUED)
-#            debug(f"SENTRY: waitpid returned {status=}")
-#            debug(f"SENTRY: {os.WIFSTOPPED(status)=} {os.WIFEXITED(status)=} {os.WIFSIGNALED(status)=} {os.WIFCONTINUED(status)=}")
-            if os.WIFSTOPPED(status):
-                # let the controller know we've stopped
-                _write_object(fp, ("stopped", 0))
-            elif os.WIFEXITED(status):
-                # we've exited. return the status back to the controller
-                _write_object(fp, ("exited", os.WEXITSTATUS(status)))
-                break
-            elif os.WIFSIGNALED(status):
-                # we've exited. return the status back to the controller
-                _write_object(fp, ("signaled", os.WTERMSIG(status)))
-                break
-            elif os.WIFCONTINUED(status):
-                # we've been continued after being stopped
-                # TODO: should we make sure the remote_pid is signaled to CONT?
+            # duplicate what's needed
+            if STDERR not in fdidx: os.dup2(slave_fd, STDERR); #debug(f"{(slave_fd, STDERR)=}")
+            if STDIN  not in fdidx: os.dup2(slave_fd, STDIN); #debug(f"{(slave_fd, STDIN)=}")
+            if STDOUT not in fdidx: os.dup2(slave_fd, STDOUT); #debug(f"{(slave_fd, STDOUT)=}")
+
+        # the parent will set up the child's process group and terminal.
+        # while that's going on, the child should wait and not execute
+        # the payload. We do this by having the child wait to receive
+        # a message via a pipe.
+        r, w = os.pipe()
+        
+        # now fork the payload process
+        pid = os.fork()
+        if pid == 0:
+            self._is_worker = True
+
+            os.close(w)             # we'll only be reading
+            conn.close()            # we won't be directly communicating to the client
+            if havetty:
+                os.close(slave_fd)  # this has now been duplicated to STD* stream
+            global _client_fp       # FIXME: massive hack, for communicating done() msg to the client
+            _client_fp = fp
+
+            # wait until the parent sets us up
+            while not len(os.read(r, 1)):
                 pass
-            else:
-                assert 0, f"weird {status=}"
+            os.close(r)
 
-        # the child has exited; clean up and leave
-        if havetty: os.close(slave_fd)
-        conn.close()
+            # return to __main__ to run the payload
+            return
+        else:
+            # change name to denote we're the sentry
+            #import setproctitle
+            #setproctitle.setproctitle(f"{' '.join(sys.argv)} [sentry for {pid=}]")
+
+            os.close(r)			# we'll only be writing
+            
+            os.setpgid(pid, pid)		# start a new process group for the child
+            if havetty:
+                os.tcsetpgrp(slave_fd, pid)	# make the child's the foreground process group (so it receives tty input+signals)
+
+            _write_object(fp, pid)		# send the child's PID back to the client
+
+            os.write(w, b"x")		# unblock the child, close the pipe
+            os.close(w)
+
+            # Loop here calling waitpid(-1, 0, WUNTRACED) to handle
+            # the child's SIGSTOP (by SIGSTOP-ing the remote_pid) and death (just exit)
+            # Really good explanation: https://stackoverflow.com/a/34845669
+            # FIXME: We should handle the case where remote_pid is killed, by
+            #        periodically timing out and checking if conn is still open...
+            #        Or, we could move all this into a SIGCHLD handler, and
+            #        constantly listen on conn?
+            #        Actually, we should do this: https://docs.python.org/3/library/signal.html#signal.set_wakeup_fd
+            while True:
+    #            debug(f"SENTRY: waitpid on {pid=}")
+                _, status = os.waitpid(pid, os.WUNTRACED | os.WCONTINUED)
+    #            debug(f"SENTRY: waitpid returned {status=}")
+    #            debug(f"SENTRY: {os.WIFSTOPPED(status)=} {os.WIFEXITED(status)=} {os.WIFSIGNALED(status)=} {os.WIFCONTINUED(status)=}")
+                if os.WIFSTOPPED(status):
+                    # let the controller know we've stopped
+                    _write_object(fp, ("stopped", 0))
+                elif os.WIFEXITED(status):
+                    # we've exited. return the status back to the controller
+                    _write_object(fp, ("exited", os.WEXITSTATUS(status)))
+                    break
+                elif os.WIFSIGNALED(status):
+                    # we've exited. return the status back to the controller
+                    _write_object(fp, ("signaled", os.WTERMSIG(status)))
+                    break
+                elif os.WIFCONTINUED(status):
+                    # we've been continued after being stopped
+                    # TODO: should we make sure the remote_pid is signaled to CONT?
+                    pass
+                else:
+                    assert 0, f"weird {status=}"
+
+            # the child has exited; clean up and leave
+            if havetty: os.close(slave_fd)
+            conn.close()
+
+            # the sentry must never return
+            sys.exit(0)
+
+        # 
+        assert False, "We should never exit this function"
 
 #############################################################################
 #
@@ -600,7 +624,7 @@ class Server:
                         # Child process -- this is where the work gets done
                         atexit.unregister(_unlink_socket)
                         sock.close()
-                        return _spawn(conn, fp)
+                        return Worker(conn, fp)
                     else:
                         conn.close()
 
@@ -615,7 +639,9 @@ class Server:
 
 def start():
     timeout = os.environ.get("INSTA_TIMEOUT", 10)
-    server.start(timeout=timeout)
+    global worker
+    worker = server.start(timeout=timeout)
+    return worker
 
 def _connect_or_serve():
     # try connecting on our socket; if fail, spawn a new server
