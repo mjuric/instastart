@@ -113,7 +113,7 @@ class Worker:
         os.environ.clear()
         os.environ.update(env)
 
-        # File descriptors that we should directly dup2-licate
+        # File descriptors that we should directly duplicate (w. dup2)
         fdidx = _read_object(fp) # a list of one or more of [STDIN, STDOUT, STDERR]
     #    debug(f"{fdidx=}")
         if len(fdidx):
@@ -130,7 +130,7 @@ class Worker:
 
         havetty = len(fdidx) != 3
         if havetty:
-            # Open a new PTY and send it back to our ccontroller process
+            # Open a new PTY and send it back to our controller process
             master_fd, slave_fd = os.openpty()
 
             # send back the master_fd, wait for master to set it up and
@@ -465,73 +465,21 @@ def _connect(timeout=None):
 
     return exitcode
 
-#if __name__ == "__main__":
-#    if os.environ.get("CLIENT", None):
-#        ret = _connect("", "")
-#    else:
-#        ret = _server("import dask.distributed", "print('Hello World!')")
-#
-#    exit(ret)
-
-# re-import main as a module, to trigger the preload
-#if not hasattr(sys.modules['instastart.auto'], "preloaded"):
-#    preloaded = True
-#    print("Hello")
-#    print(sys.modules['__main__'].__file__)
-#    print(dir(sys.modules['__main__']))
-#
-#    # import the main file as a module
-##    from importlib.util import spec_from_loader, module_from_spec
-##    from importlib.machinery import SourceFileLoader 
-##
-##    spec = spec_from_loader("foobar", SourceFileLoader("foobar", "/path/to/foobar"))
-##    foobar = module_from_spec(spec)
-##    spec.loader.exec_module(foobar)
-#
-#else:
-#    print(f"{preloaded=}")
-
 from contextlib import contextmanager
-
 @contextmanager
-def serve():
+def serve(autodone=True):
+    # Convenience function to wrap a block of code in a context manager
     start()
     
-#    code = 0
-#    try:
-
+    # return to execute the user's code
     yield
 
-#    except SystemExit as e:
-#        code = e.code
-#        raise
-#    except Exception:
-#        raise
-#        import traceback
-#        print(traceback.format_exc(), file=sys.stderr)
-#        raise
-#    finally:
-#        return
-#        if code is None:
-#            done(0)
-#        elif isinstance(code, int):
-#            done(code)
-#        else:
-#            done(1)
-
-def done(exitcode=0):
-    # Flush the output back to the client
-    if not sys.stdout.closed: sys.stdout.flush()
-    if not sys.stderr.closed: sys.stderr.flush()
-    
-    # signal the client we've finished, and that it should
-    # move on.
-    #
-    # FIXME: HACK: This is a _HUGE_ hack, introducing a race condition w. the sentry process.
-    #              only the sentry should ever be talking to _client_fp; we should
-    #              have a pipe back to the sentry instead.
-    global _client_fp
-    _write_object(_client_fp, ("exited", exitcode))
+    # This is intentionally vulnerable to exceptions; if an exception occurs
+    # in the user's code, we don't want to terminate the connection to the
+    # client early. Instead, we want to let any output the worker will throw
+    # out (tracebacks, etc.) be streamed back to the client.
+    if autodone:
+        done()
 
 def _unlink_socket():
     # atexit handler registered by _server

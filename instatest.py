@@ -1,4 +1,4 @@
-from instastart.auto import start, done
+from instastart.auto import serve
 
 import dask.distributed as dd
 #import astropy
@@ -25,18 +25,17 @@ def run_echo():
     print("Exiting tqdm_echo")
 
 if __name__ == "__main__":
-    start()
+    with serve():
+        print("Here!")
+        print(f"{sys.argv=}")
+        print(f"{os.getcwd()=}")
+        print(f"{os.environ['PWD']=}")
+        print(f"{os.environ.get('FOOBAR', None)=}")
+        run_tqdm()
+#       os.execl('/usr/bin/htop', 'htop')
 
-    print("Here!")
-    print(f"{sys.argv=}")
-    print(f"{os.getcwd()=}")
-    print(f"{os.environ['PWD']=}")
-    print(f"{os.environ.get('FOOBAR', None)=}")
-    run_tqdm()
-#    os.execl('/usr/bin/htop', 'htop')
-
-    done()
-    pass
-#        os.execl("/astro/users/mjuric/lfs/bin/joe", "joe")
-#        print(f"{__file__=}")
-#        print("I'm here!")
+        pass
+#           os.execl("/astro/users/mjuric/lfs/bin/joe", "joe")
+#           print(f"{__file__=}")
+#           print("I'm here!")
+    print("Left the instastart context manager!")
