@@ -77,6 +77,20 @@ class Worker:
             if not self._is_worker:
                 sys.exit(0)
 
+    def done(self, exitcode=0):
+        # signal the client we've finished and that it can safely pretend
+        # this process has exited.
+        assert self._is_worker, "This function can only be called from within the worker process"
+
+        # Flush the output back to the client
+        if not sys.stdout.closed: sys.stdout.flush()
+        if not sys.stderr.closed: sys.stderr.flush()
+
+        # FIXME: HACK: This is a _HUGE_ hack, introducing a race condition w. the sentry process.
+        #              only the sentry should ever be talking to _client_fp; we should
+        #              have a pipe back to the sentry instead.
+        _write_object(self._client_fp, ("exited", exitcode))
+
     def _spawn(self, conn, fp):
         # Fork the sentry and worker processes to execute the payload.
         #
@@ -151,8 +165,7 @@ class Worker:
             conn.close()            # we won't be directly communicating to the client
             if havetty:
                 os.close(slave_fd)  # this has now been duplicated to STD* stream
-            global _client_fp       # FIXME: massive hack, for communicating done() msg to the client
-            _client_fp = fp
+            self._client_fp = fp    # FIXME: massive hack, for communicating the done() msg to the client
 
             # wait until the parent sets us up
             while not len(os.read(r, 1)):
@@ -639,9 +652,18 @@ class Server:
 
 def start():
     timeout = os.environ.get("INSTA_TIMEOUT", 10)
+
     global worker
     worker = server.start(timeout=timeout)
+
     return worker
+
+def done(exitcode=0):
+    # signal the client we've finished and that it can safely pretend
+    # this process has exited.
+    #
+    # May only be called from the worker (i.e., after start() has been called).
+    worker.done(exitcode)
 
 def _connect_or_serve():
     # try connecting on our socket; if fail, spawn a new server
