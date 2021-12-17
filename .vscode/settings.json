@@ -1,0 +1,16 @@
+{
+    "cSpell.words": [
+        "DSUSP",
+        "getpid",
+        "SIGCHLD",
+        "SIGTSTP",
+        "SIGTTOU",
+        "winsz",
+        "WUNTRACED",
+        "xpixel",
+        "ypixel"
+    ],
+    "cSpell.ignoreWords": [
+        "SUSP"
+    ]
+}

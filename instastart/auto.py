@@ -4,7 +4,7 @@
 #  * Proper logging
 #  * Tests
 #
-import socket, os, sys, marshal, tty, fcntl, termios, select, signal
+import socket, os, sys, pickle, tty, fcntl, termios, select, signal
 from contextlib import contextmanager
 
 # Helpful constants
@@ -70,12 +70,12 @@ def _setwinsize(fd, winsz):
 #############################################################################
 
 def _read_object(fp):
-    """ Read a marshaled object from file fp """
-    return marshal.load(fp)
+    """ Read a pickled object from file fp """
+    return pickle.load(fp)
 
 def _write_object(fp, obj):
-    """ Write an object to file fp, using marshal """
-    return marshal.dump(obj, fp)
+    """ Write an object to file fp, using pickle """
+    return pickle.dump(obj, fp, -1)
 
 def _writen(fd, data):
     """Write all the data to a descriptor."""
@@ -232,9 +232,13 @@ class Worker:
         # this process has exited.
         assert self._is_worker, "This function can only be called from within the worker process"
 
-        # Flush the output back to the client
-        if not sys.stdout.closed: sys.stdout.flush()
-        if not sys.stderr.closed: sys.stderr.flush()
+        # Flush the output back to the client and close all streams
+        for stream in [ sys.stdout, sys.stderr ]:
+            if not stream.closed:
+                stream.flush()
+                stream.close()
+        if not sys.stdin.closed:
+            sys.stdin.close()
 
         # FIXME: HACK: This is a _HUGE_ hack, introducing a race condition w. the sentry process.
         #              only the sentry should ever be talking to _client_fp; we should
@@ -251,34 +255,11 @@ class Worker:
         #
         # Returns only in the worker process.
 
-        # receive the command line
-        sys.argv = _read_object(fp)
-        
-        # receive the cwd (and change to it)
-        cwd = _read_object(fp)
-        os.chdir(cwd)
-
-        # receive the environment
-        env = _read_object(fp)
-        os.environ.clear()
-        os.environ.update(env)
-
-        # File descriptors that we should directly duplicate (w. dup2)
-        fdidx = _read_object(fp) # a list of one or more of [STDIN, STDOUT, STDERR]
-        # debug(f"{fdidx=}")
-        if len(fdidx):
-            _, fds, _, _ = socket.recv_fds(conn, 10, maxfds=len(fdidx))
-        else:
-            fds = []
-        # debug(f"{fds=}")
-        for a, b in zip(fds, fdidx):
-            # debug(f"_spawn: duplicating fd {a} to {b}")
-            os.dup2(a, b)
-
-        # receive the client PID (FIXME: we don't really use this)
-        remote_pid = _read_object(fp)
-
-        havetty = len(fdidx) != 3
+        # load the run specification, and apply it to our process
+        rs = RunSpec.from_socket(conn, fp)
+        rs.apply_to_self()
+    
+        havetty = len(rs.pipes) != 3
         if havetty:
             # Open a new PTY and send it back to our controller process
             master_fd, slave_fd = os.openpty()
@@ -296,9 +277,9 @@ class Worker:
             fcntl.ioctl(slave_fd, termios.TIOCSCTTY)
 
             # duplicate what's needed
-            if STDERR not in fdidx: os.dup2(slave_fd, STDERR); #debug(f"{(slave_fd, STDERR)=}")
-            if STDIN  not in fdidx: os.dup2(slave_fd, STDIN); #debug(f"{(slave_fd, STDIN)=}")
-            if STDOUT not in fdidx: os.dup2(slave_fd, STDOUT); #debug(f"{(slave_fd, STDOUT)=}")
+            if STDERR not in rs.pipes: os.dup2(slave_fd, STDERR); #debug(f"{(slave_fd, STDERR)=}")
+            if STDIN  not in rs.pipes: os.dup2(slave_fd, STDIN); #debug(f"{(slave_fd, STDIN)=}")
+            if STDOUT not in rs.pipes: os.dup2(slave_fd, STDOUT); #debug(f"{(slave_fd, STDOUT)=}")
 
         # the parent will set up the child's process group and terminal.
         # while that's going on, the child should wait and not execute
@@ -386,6 +367,54 @@ class Worker:
 #   Client
 #
 #############################################################################
+
+class RunSpec:
+    # specification of a worker run. Things like argv, cwd, environ, and file
+    # descriptors.
+    def __init__(self):
+        pass
+
+    @staticmethod
+    def from_self():
+        # constructs the run specification from the current process. This is
+        # usually how this class is meant to be constructed, from the client.
+        self = RunSpec()
+
+        self.argv = sys.argv
+        self.cwd = os.getcwd()
+        self.environ = os.environ.copy()
+        self.pid = os.getpid()
+
+        # find which one of our STD* descriptors point to the tty.
+        # send non-tty file descriptors to the worker. These will
+        # be dup2-ed by the worker, allowing for zero-overhead operation.
+        self.pipes = list(filter(lambda fd: not os.isatty(fd), [STDIN, STDOUT, STDERR]))
+        return self
+
+    def apply_to_self(self):
+        # apply the run specification to the current process
+        sys.argv = self.argv
+        os.chdir(self.cwd)
+        os.environ.clear()
+        os.environ.update(self.environ)
+
+        # File descriptors that we can directly duplicate (w. dup2)
+        for a, b in zip(self.fds, self.pipes):
+            os.dup2(a, b)
+
+    def write(self, conn, fp):
+        _write_object(fp, self)
+        if len(self.pipes):
+            socket.send_fds(conn, [ b'm' ], self.pipes)
+
+    @staticmethod
+    def from_socket(conn, fp):
+        self = _read_object(fp)
+        if len(self.pipes):
+            _, self.fds, _, _ = socket.recv_fds(conn, 10, maxfds=len(self.pipes))
+        else:
+            self.fds = []
+        return self
 
 #
 # Handling broken pipe-related errors:
@@ -528,39 +557,53 @@ class Client:
             _write_object(fp, cmd)
             sys.exit(0)
 
-        # tell the server we want to run a command
+        # this is a command run
         _write_object(fp, "run")
 
-        # send our command line
-        _write_object(fp, sys.argv)
+        rs = RunSpec.from_self()
+        rs.write(client, fp)
 
-        # send cwd
-        _write_object(fp, os.getcwd())
+        # get a read/write file descriptor to our tty unless all std* streams are pipes
+        if len(rs.pipes) != 3:
+            fd = (set([STDIN, STDOUT, STDERR]) - set(rs.pipes)).pop()
+            ttyname = os.ttyname(fd)
+            tty_fd = os.open(ttyname, os.O_RDWR)
+        else:
+            tty_fd = None
 
-        # send environment
-        _write_object(fp, os.environ.copy())
+        # # tell the server we want to run a command
+        # _write_object(fp, "run")
 
-        # find which one of our STD* descriptors point to the tty.
-        # send non-tty file descriptors directly to the worker. These will
-        # be dup2-ed, rather than manually copied to in the _copy loop.
-        pipes = filter(lambda fd: not os.isatty(fd), [STDIN, STDOUT, STDERR])
-        pipes, tty_fd = [], None
-        for fd in [STDIN, STDOUT, STDERR]:
-            if not os.isatty(fd):
-                pipes.append(fd)
-            elif tty_fd is None:
-                ttyname = os.ttyname(fd)
-                # debug(f"{ttyname=}")
-                tty_fd = os.open(ttyname, os.O_RDWR)
+        # # send our command line
+        # _write_object(fp, sys.argv)
 
-        # debug(f"Non-tty {pipes=}")
-        # debug(f"{tty_fd=}")
-        _write_object(fp, pipes)
-        if len(pipes):
-            socket.send_fds(client, [ b'm' ], pipes)
+        # # send cwd
+        # _write_object(fp, os.getcwd())
 
-        # send our PID (FIXME: is this necessary?)
-        _write_object(fp, os.getpid())
+        # # send environment
+        # _write_object(fp, os.environ.copy())
+
+        # # find which one of our STD* descriptors point to the tty.
+        # # send non-tty file descriptors directly to the worker. These will
+        # # be dup2-ed, rather than manually copied to in the _copy loop.
+        # pipes = filter(lambda fd: not os.isatty(fd), [STDIN, STDOUT, STDERR])
+        # pipes, tty_fd = [], None
+        # for fd in [STDIN, STDOUT, STDERR]:
+        #     if not os.isatty(fd):
+        #         pipes.append(fd)
+        #     elif tty_fd is None:
+        #         ttyname = os.ttyname(fd)
+        #         # debug(f"{ttyname=}")
+        #         tty_fd = os.open(ttyname, os.O_RDWR)
+
+        # # debug(f"Non-tty {pipes=}")
+        # # debug(f"{tty_fd=}")
+        # _write_object(fp, pipes)
+        # if len(pipes):
+        #     socket.send_fds(client, [ b'm' ], pipes)
+
+        # # send our PID (FIXME: is this necessary?)
+        # _write_object(fp, os.getpid())
 
         if tty_fd is not None:
             # we'll need a pty. the server will create it for us, and we
