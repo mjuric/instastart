@@ -437,7 +437,7 @@ class Client:
     # See: https://www.gnu.org/software/libc/manual/html_node/Signal-Characters.html
     # See: https://www.gnu.org/software/libc/manual/html_node/Termination-Signals.html
 
-    def _copy(self, master_fd, tty_fd, control_fp, termios_attr, remote_pid):
+    def _communicate(self, master_fd, tty_fd, control_fp, termios_attr, remote_pid):
         """Copy and control loop
         Copies
                 pty master -> standard output   (master_read)
@@ -449,11 +449,11 @@ class Client:
         fds = [ control_fd ]
         if master_fd is not None: fds.append(master_fd)
         if tty_fd is not None: fds.append(tty_fd)
-        import time
+        
         # debug(f"{fds=} {master_fd=} {tty_fd=}")
         while fds:
             rfds, _wfds, _xfds = select.select(fds, [], [])
-            # debug(f"{rfds=} {time.time()=}")
+            # import time; debug(f"{rfds=} {time.time()=}")
 
             # received output
             if master_fd in rfds:
@@ -506,7 +506,7 @@ class Client:
                         s = fcntl.ioctl(tty_fd, termios.TIOCGWINSZ, '\0'*8)
                         fcntl.ioctl(master_fd, termios.TIOCSWINSZ, s)
 
-                    # FIXME: we should message the nanny to do this (pid race condition!)
+                    # FIXME: we should message the sentry to do this (pid race condition!)
                     os.killpg(os.getpgid(remote_pid), signal.SIGCONT)	# wake up the worker process
                 elif event == "exited":
                     return data # data is the exitstatus
@@ -563,49 +563,12 @@ class Client:
         rs = RunSpec.from_self()
         rs.write(client, fp)
 
-        # get a read/write file descriptor to our tty unless all std* streams are pipes
         if len(rs.pipes) != 3:
+            # set up the pty if the client is connected to a tty
             fd = (set([STDIN, STDOUT, STDERR]) - set(rs.pipes)).pop()
             ttyname = os.ttyname(fd)
             tty_fd = os.open(ttyname, os.O_RDWR)
-        else:
-            tty_fd = None
 
-        # # tell the server we want to run a command
-        # _write_object(fp, "run")
-
-        # # send our command line
-        # _write_object(fp, sys.argv)
-
-        # # send cwd
-        # _write_object(fp, os.getcwd())
-
-        # # send environment
-        # _write_object(fp, os.environ.copy())
-
-        # # find which one of our STD* descriptors point to the tty.
-        # # send non-tty file descriptors directly to the worker. These will
-        # # be dup2-ed, rather than manually copied to in the _copy loop.
-        # pipes = filter(lambda fd: not os.isatty(fd), [STDIN, STDOUT, STDERR])
-        # pipes, tty_fd = [], None
-        # for fd in [STDIN, STDOUT, STDERR]:
-        #     if not os.isatty(fd):
-        #         pipes.append(fd)
-        #     elif tty_fd is None:
-        #         ttyname = os.ttyname(fd)
-        #         # debug(f"{ttyname=}")
-        #         tty_fd = os.open(ttyname, os.O_RDWR)
-
-        # # debug(f"Non-tty {pipes=}")
-        # # debug(f"{tty_fd=}")
-        # _write_object(fp, pipes)
-        # if len(pipes):
-        #     socket.send_fds(client, [ b'm' ], pipes)
-
-        # # send our PID (FIXME: is this necessary?)
-        # _write_object(fp, os.getpid())
-
-        if tty_fd is not None:
             # we'll need a pty. the server will create it for us, and we
             # need to receive and set it up.
             _, (master_fd,), _, _ = socket.recv_fds(client, 10, maxfds=1)
@@ -622,7 +585,7 @@ class Client:
             )
         else:
             # no tty, pipes all the way
-            master_fd = termios_attr = None
+            tty_fd = master_fd = termios_attr = None
 
         # get the child PID
         remote_pid = _read_object(fp)
@@ -639,7 +602,7 @@ class Client:
                 tty.setraw(tty_fd)
 
             # Now enter the communication forwarding loop
-            exitcode = self._copy(master_fd, tty_fd, fp, termios_attr, remote_pid)
+            exitcode = self._communicate(master_fd, tty_fd, fp, termios_attr, remote_pid)
         finally:
             # restore our console
             if tty_fd is not None:
