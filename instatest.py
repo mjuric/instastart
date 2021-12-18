@@ -32,6 +32,8 @@ if __name__ == "__main__":
         print(f"{os.environ['PWD']=}")
         print(f"{os.environ.get('FOOBAR', None)=}")
         run_tqdm()
+        import time
+        time.sleep(10)
 #       os.execl('/usr/bin/htop', 'htop')
 
         pass

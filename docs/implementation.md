@@ -192,3 +192,10 @@ same effect as killing the underlying worker.  SIGWINCH is handhled
 differently -- it's caught, the new terminal window size is read, and
 written to the worker pty's master_fd (which causes the pty to trigger
 SIGWINCH on the worker, which can then handle the window size change).
+
+## Useful Links
+
+* Handling broken pipe-related errors: https://bugs.python.org/issue11380,#msg153320
+* Really useful explanation of how SIGTSTP SIGSTOP CTRL-Z work: https://news.ycombinator.com/item?id=8773740
+* Signal characters: https://www.gnu.org/software/libc/manual/html_node/Signal-Characters.html
+* Termination signals: https://www.gnu.org/software/libc/manual/html_node/Termination-Signals.html

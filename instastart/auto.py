@@ -4,7 +4,7 @@
 #  * Proper logging
 #  * Tests
 #
-import socket, os, sys, pickle, tty, fcntl, termios, select, signal
+import socket, os, sys, pickle, tty, fcntl, termios, select, signal, inspect, hashlib
 from contextlib import contextmanager
 
 # Helpful constants
@@ -17,38 +17,43 @@ STDERR = 2
 worker = None
 server = None
 
-# construct our unique socket name
 def _construct_socket_name():
-    import inspect, hashlib
+    # construct a UNIX socket path reasonably unique to this program
+    # invocation. This is where the server will listen for client
+    # connections.
 
-    # the name of the file at the top of the call stack (should be our main file)
+    # the name of the file at the top of the call stack (should be our __main__)
     pth = inspect.stack()[-1].filename
     py = sys.executable
     env = "PYTHONPATH=" + os.environ.get("PYTHONPATH",'')
 
-    state=f"{pth}-{py}-{env}"
-
     # compute the md5 of the elements that affect the execution environment,
     # to get something unique.
-    # FIXME: this should also incorporate environ, current python interpreted
+    state=f"{pth}-{py}-{env}"
     md5 = hashlib.md5(state.encode('utf-8')).hexdigest()
 
-    # take the filename, w/o the extension
+    # take the __main__'s filename, w/o the extension
     fn = pth.split('/')[-1].split('.')[0]
 
+    # FIXME: handle the case where XDG_RUNTIME_DIR isn't defined
     return os.path.join(os.environ['XDG_RUNTIME_DIR'], f"{fn}.{md5}.socket")
 
-# our own fast-ish logging routines
-# (importing logging seems to add ~15msec to runtime, tested on macOS/MBA)
-#
+def _setproctitle(title):
+    # change our process' title (as viewed in utilities like ps or top)
+    try:
+        import setproctitle
+        setproctitle.setproctitle(title)
+    except ImportError:
+        pass
+
 def debug(*argv, **kwargs):
+    # our own fast-ish logging routines (importing logging seems to add
+    # ~15msec to runtime, tested on macOS/MBA)
     kwargs['file'] = sys.stderr
     return print(*argv, **kwargs)
 
 #############################################################################
-#
-#   Pty management routines
-#
+#   Pty management 
 #############################################################################
 
 def _getwinsize(fd):
@@ -64,9 +69,7 @@ def _setwinsize(fd, winsz):
     return fcntl.ioctl(fd, termios.TIOCSWINSZ, winsz)
 
 #############################################################################
-#
-#   Low-level socket communication routines
-#
+#   Low-level socket communication
 #############################################################################
 
 def _read_object(fp):
@@ -83,10 +86,15 @@ def _writen(fd, data):
         n = os.write(fd, data)
         data = data[n:]
 
+def _readn(fd, n):
+    """Read n bytes from a file descriptor."""
+    s = os.read(fd, n)
+    while len(s) < n:
+        s += os.read(fd, len(s) - n)
+    return s
+
 #############################################################################
-#
 #   Server
-#
 #############################################################################
 
 class Server:
@@ -96,37 +104,32 @@ class Server:
     def __init__(self, socket_path) -> None:
         self.socket_path = socket_path
 
-    def _unlink_socket(self):
-        # atexit handler registered by _server
-        if os.path.exists(self.socket_path):
-            os.unlink(self.socket_path)
-
     def fork_and_wait_for_server(self):
-        _r, _w = os.pipe()
+        # For this process and wait until the server is ready to accept
+        # connections, This is called by _connect_or_serve() to instantiate
+        # the server (as a child process) before the parent continues to act
+        # as a client.
+
+        _r, _w = os.pipe()  # this is how the server will tell us it's ready
         pid = os.fork()
         if pid == 0:
+            # child (== worker)
             os.close(_r)
-            import setproctitle
             name = sys.argv[0].split('/')[-1]
-            setproctitle.setproctitle(f"[instastart: {name}]")
+            _setproctitle(f"[instastart: {name}]")
 
-            # child -- this is what will become the server. Just fall through
-            # the code, to be caught in start(). This will launch the
-            # server, setting up its socket, etc., and signaling we're ready by
-            # writing to _r pipe.
-
-            # start a new session, to protect the child from SIGHUPs, etc.
-            # we don't double-fork as the daemon never really does anything
-            # funny with the tty (TODO: should we still double-fork, just in case?)
+            # start a new session, to protect the child from SIGHUPs, etc. we
+            # don't double-fork as the daemon never really does anything
+            # funny with the tty (TODO: should we still double-fork, just in
+            # case?)
             os.setsid()
 
             # now fall through until we hit start() somewhere in __main__
             self._readypipe = _w
-            pass
         else:
+            # parent -- we'll wait for the server to become available, then
+            # connect to it.
             os.close(_w)
-            # parent -- we'll wait for the server to become available, then connect to it.
-            # print(f"Awaiting a signal at {socket_path=}")
             while True:
                 msg = os.read(_r, 1)
                 # debug(msg)
@@ -135,6 +138,12 @@ class Server:
             os.close(_r)
             # print(f"Signal received!")
         return pid
+
+    def _unlink_socket(self):
+        # atexit handler registered by _serve() to ensure we clean up our
+        # socket on exit.
+        if os.path.exists(self.socket_path):
+            os.unlink(self.socket_path)
 
     def _serve(self, timeout):
         # this is invoked by start(), at a point where user's one-time
@@ -291,6 +300,7 @@ class Worker:
         pid = os.fork()
         if pid == 0:
             self._is_worker = True
+            _setproctitle(f"[{' '.join(sys.argv)} :: worker/{rs.pid}]")
 
             os.close(w)             # we'll only be reading
             conn.close()            # we won't be directly communicating to the client
@@ -307,8 +317,7 @@ class Worker:
             return
         else:
             # change name to denote we're the sentry
-            #import setproctitle
-            #setproctitle.setproctitle(f"{' '.join(sys.argv)} [sentry for {pid=}]")
+            _setproctitle(f"[{' '.join(sys.argv)} :: sentry/{rs.pid}]")
 
             os.close(r)			# we'll only be writing
             
@@ -416,26 +425,11 @@ class RunSpec:
             self.fds = []
         return self
 
-#
-# Handling broken pipe-related errors:
-#   https://bugs.python.org/issue11380,#msg153320
-#
-
-#
-# Really useful explanation of how SIGTSTP SIGSTOP CTRL-Z work:
-#   https://news.ycombinator.com/item?id=8773740
-#
 class Client:
     socket_path = None   # path to the UNIX socket we connect to
 
     def __init__(self, socket_path) -> None:
         self.socket_path = socket_path
-
-    # we need to catch & pass on:
-    # INTR, QUIT, SUSP, or DSUSP ==> SIGINT, SIGQUIT, SIGTSTP, SIGTERM
-    # and then we need SIGCONT for recovery
-    # See: https://www.gnu.org/software/libc/manual/html_node/Signal-Characters.html
-    # See: https://www.gnu.org/software/libc/manual/html_node/Termination-Signals.html
 
     def _communicate(self, master_fd, tty_fd, control_fp, termios_attr, remote_pid):
         """Copy and control loop
