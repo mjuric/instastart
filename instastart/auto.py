@@ -14,8 +14,8 @@ STDERR = 2
 
 # These get set in their respective processes. They really shouldn't be
 # touched by user code (an internal implementation detail)
-worker = None
-server = None
+_worker = None
+_server = None
 
 def _construct_socket_name():
     # construct a UNIX socket path reasonably unique to this program
@@ -613,17 +613,17 @@ class Client:
 def start():
     timeout = os.environ.get("INSTA_TIMEOUT", 10)
 
-    global worker
-    worker = server.start(timeout=timeout)
+    global _worker
+    _worker = _server.start(timeout=timeout)
 
-    return worker
+    return _worker
 
 def done(exitcode=0):
     # signal the client we've finished and that it can safely pretend
     # this process has exited.
     #
     # May only be called from the worker (i.e., after start() has been called).
-    worker.done(exitcode)
+    _worker.done(exitcode)
 
 @contextmanager
 def serve(autodone=True):
@@ -667,4 +667,4 @@ def _connect_or_serve():
         # should be prewarmed until it's paused in start()
         return server
 
-server = _connect_or_serve()
+_server = _connect_or_serve()
