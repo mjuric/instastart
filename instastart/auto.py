@@ -101,8 +101,9 @@ class Server:
     _readypipe = None   # the pipe that .start() uses to signal the server is ready
     socket_path = None  # path to the UNIX socket we listen on
 
-    def __init__(self, socket_path) -> None:
+    def __init__(self, socket_path, log_path) -> None:
         self.socket_path = socket_path
+        self.log_path = log_path
 
     def fork_and_wait_for_server(self):
         # For this process and wait until the server is ready to accept
@@ -120,9 +121,19 @@ class Server:
 
             # start a new session, to protect the child from SIGHUPs, etc. we
             # don't double-fork as the daemon never really does anything
-            # funny with the tty (TODO: should we still double-fork, just in
-            # case?)
+            # funny with the tty.
             os.setsid()
+
+            # close whatever we've had open for stdin/out/err, and redirect
+            # the server output to a log file (/dev/null, by default).
+            # Note: https://docs.python.org/3/faq/library.html#why-doesn-t-closing-sys-stdout-stdin-stderr-really-close-it
+            os.close(0)
+            os.close(1)
+            os.close(2)
+            fd = os.open(self.log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+            os.dup2(fd, 1)
+            os.dup2(fd, 2)
+            os.close(fd)
 
             # now fall through until we hit start() somewhere in __main__
             self._readypipe = _w
@@ -652,7 +663,7 @@ def _connect_or_serve():
 
     # fork the server. This will return pid or 0, depending on if it's
     # child or parent
-    server = Server(socket_path)
+    server = Server(socket_path, os.environ.get("INSTA_LOG", os.devnull))
     if server.fork_and_wait_for_server() != 0:
         # parent (== client)
 
@@ -663,7 +674,7 @@ def _connect_or_serve():
         else:
             raise Exception("Uh-oh... Failed to connect to instastart background process!")
     else:
-        # this will fall through the code until, running all code that
+        # this will fall through, running all code that
         # should be prewarmed until it's paused in start()
         return server
 
