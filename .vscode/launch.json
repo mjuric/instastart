@@ -11,7 +11,8 @@
             "program": "${workspaceFolder}/instatest.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
-            "subProcess": true
+            "subProcess": true,
+//            "args": [ ">", "foo.log", "2>&1", "<", "/dev/null" ]
         }
     ]
 }

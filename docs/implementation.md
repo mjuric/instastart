@@ -199,3 +199,4 @@ SIGWINCH on the worker, which can then handle the window size change).
 * Really useful explanation of how SIGTSTP SIGSTOP CTRL-Z work: https://news.ycombinator.com/item?id=8773740
 * Signal characters: https://www.gnu.org/software/libc/manual/html_node/Signal-Characters.html
 * Termination signals: https://www.gnu.org/software/libc/manual/html_node/Termination-Signals.html
+* tty raw mode: https://stackoverflow.com/questions/51509348/python-tty-setraw-ctrl-c-doesnt-work-getch
