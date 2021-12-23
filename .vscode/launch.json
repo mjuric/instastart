@@ -5,6 +5,14 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "Pytest",
+            "type": "python",
+            "request": "launch",
+            "module": "pytest",
+            "args": [ "--no-cov", "${file}::test_stop" ],
+            "cwd": "${workspaceFolder}"
+        },
+        {
             "name": "Python: instatest",
             "type": "python",
             "request": "launch",
@@ -12,7 +20,7 @@
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
             "subProcess": true,
-//            "args": [ ">", "foo.log", "2>&1", "<", "/dev/null" ]
+            //            "args": [ ">", "foo.log", "2>&1", "<", "/dev/null" ]
         }
     ]
 }
