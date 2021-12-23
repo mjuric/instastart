@@ -17,6 +17,13 @@ STDERR = 2
 _worker = None
 _server = None
 
+def _debug_write_pid(name):
+    # debugging/profiling aid: write out our PID into a file in
+    # $INSTA_PID_DIR directory
+    if "INSTA_PID_DIR" in os.environ:
+        with open(os.path.join(os.environ["INSTA_PID_DIR"], f"{name}.pid"), "w") as fp:
+            print(os.getpid(), file=fp)
+
 def _construct_socket_name():
     # construct a UNIX socket path reasonably unique to this program
     # invocation. This is where the server will listen for client
@@ -40,7 +47,6 @@ def _construct_socket_name():
 
 def _setproctitle(title):
     # change our process' title (as viewed in utilities like ps or top)
-    return
     try:
         import setproctitle
         setproctitle.setproctitle(title)
@@ -115,7 +121,9 @@ class Server:
         _r, _w = os.pipe()  # this is how the server will tell us it's ready
         pid = os.fork()
         if pid == 0:
-            # child (== worker)
+            # child (== server)
+            _debug_write_pid("server")
+
             os.close(_r)
             name = sys.argv[0].split('/')[-1]
             _setproctitle(f"[instastart: {name}]")
@@ -151,12 +159,6 @@ class Server:
             # print(f"Signal received!")
         return pid
 
-    def _unlink_socket(self):
-        # atexit handler registered by _serve() to ensure we clean up our
-        # socket on exit.
-        if os.path.exists(self.socket_path):
-            os.unlink(self.socket_path)
-
     def _serve(self, timeout):
         # this is invoked by start(), at a point where user's one-time
         # (heavy) initialization has completed. We'll pause execution,
@@ -171,59 +173,64 @@ class Server:
         if os.path.exists(spath):
             os.unlink(spath)
 
-        # make sure we clean up if anything goes wrong
-        import atexit
-        atexit.register(self._unlink_socket)
-
         # debug(f"Opening socket at {socket_path=} with {timeout=}...", end='')
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(timeout)
-            os.fchmod(sock.fileno(), 0o700)		# security: only allow the user to do anything w. the socket
-            sock.bind(spath)
-            sock.listen()
-            os.rename(spath, self.socket_path)
-            # debug(' done.')
+        child_pid = 0
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(timeout)
+                os.fchmod(sock.fileno(), 0o700)		# security: only allow the user to do anything w. the socket
+                sock.bind(spath)
+                sock.listen()
+                os.rename(spath, self.socket_path)
+                # debug(' done.')
 
-            if self._readypipe is not None:
-                # debug('signaling on readypipe')
-                # signal to the reader the server is ready to accept connections
-                os.write(self._readypipe, b"x")
-                os.close(self._readypipe)
-                self._readypipe = None
-                # debug('done')
+                if self._readypipe is not None:
+                    # debug('signaling on readypipe')
+                    # signal to the reader the server is ready to accept connections
+                    os.write(self._readypipe, b"x")
+                    os.close(self._readypipe)
+                    self._readypipe = None
+                    # debug('done')
 
-            # Await for client connections (or server commands)
-            while True:
-                try:
-                    conn, _ = sock.accept()
-                except socket.timeout:
-                    debug("Server timeout. Exiting")
-                    sys.exit(0)
-                # debug(f"Connection accepted")
+                # Await for client connections (or server commands)
+                while True:
+                    try:
+                        conn, _ = sock.accept()
+                    except socket.timeout:
+                        debug("Server timeout. Exiting")
+                        sys.exit(0)
+                    # debug(f"Connection accepted")
 
-                # make our life easier & create a file-like object
-                fp = conn.makefile(mode='rwb', buffering=0)
+                    # make our life easier & create a file-like object
+                    fp = conn.makefile(mode='rwb', buffering=0)
 
-                cmd = _read_object(fp)
-                # debug(f"{cmd=}")
-                if cmd == "stop":
-                    # exit the listen loop
-                    debug("Server received a command to exit. Exiting")
-                    sys.exit(0)
-                elif cmd == "run":
-                    # Fork a child process to do the work.
-                    pid = os.fork()
-                    if pid == 0:
-                        # Child process -- this is where the work gets done
-                        atexit.unregister(self._unlink_socket)
-                        sock.close()
-                        return Worker(conn, fp)
-                    else:
-                        conn.close()
+                    cmd = _read_object(fp)
+                    # debug(f"{cmd=}")
+                    if cmd == "stop":
+                        # exit the listen loop
+                        debug("Server received a command to exit. Exiting")
+                        sys.exit(0)
+                    elif cmd == "run":
+                        # Fork a child process to do the work.
+                        child_pid = os.fork()
+                        if child_pid == 0:
+                            _debug_write_pid("sentry")
+                            # Child process -- this is where the work gets done
+                            sock.close()
+                            return Worker(conn, fp)
+                        else:
+                            conn.close()
+        finally:
+            if child_pid != 0:
+                # server process exiting. clean up the socket file(s).
+                if os.path.exists(spath):
+                    os.unlink(spath)
+                if os.path.exists(self.socket_path):
+                    os.unlink(self.socket_path)
 
         # This function will continue _only_ in the spawned child process,
         # and execute the main program.
-        assert False, "This function should only return in a worker process!"
+        assert False, "This function should only return in a worker process!" # pragma: no cover
 
     def start(self, timeout):
         # run the server. Returns only in the forked worker process.
@@ -305,6 +312,7 @@ class Worker:
         # fork the worker process
         pid = os.fork()
         if pid == 0:
+            _debug_write_pid("worker")
             self._is_worker = True
             _setproctitle(f"[{' '.join(sys.argv)} :: worker/{pipe.pid}]")
 
@@ -312,9 +320,9 @@ class Worker:
             conn.close()            # we won't be directly communicating to the client
             self._client_fp = fp    # FIXME: massive hack, for communicating the done() msg to the client
 
-            # wait until the parent sets us up
-            while not len(os.read(r, 1)):
-                pass
+            # wait until the sentry sets us up
+            if os.read(r, 1) != b"x":
+                raise Exception("[worker] sentry closed the pipe w/o starting us.") # pragma: no cover
             os.close(r)
 
             # return to __main__ to run the payload
@@ -323,24 +331,24 @@ class Worker:
             # change name to denote we're the sentry
             _setproctitle(f"[{' '.join(sys.argv)} :: sentry/{pipe.pid}]")
 
-            os.close(r)			# we'll only be writing
+            os.close(r)                 # we'll only be writing
             
-            os.setpgid(pid, pid)		# start a new process group for the child
+            os.setpgid(pid, pid)        # start a new process group for the child
             if pipe.tty is not None:
                 os.tcsetpgrp(pipe.tty, pid)	# make the child's the foreground process group (so it receives tty input+signals)
 
-            _write_object(fp, pid)		# send the child's PID back to the client
+            _write_object(fp, pid)      # send the child's PID back to the client
 
-            os.write(w, b"x")		# unblock the child, close the pipe
+            os.write(w, b"x")           # unblock the child, close the pipe
             os.close(w)
 
             try:
                 self._sentry_loop(fp, pid)
             finally:
                 conn.close()
-                os._exit(0)
+                os.exit(0)
 
-        assert False, "We should never exit this function"
+        assert False, "We should never exit this function" #pragma: no cover
 
     def _sentry_loop(self, fp, pid):
         # Loop here calling waitpid(-1, 0, WUNTRACED) to handle
@@ -372,7 +380,7 @@ class Worker:
                 # TODO: should we make sure the remote_pid is signaled to CONT?
                 pass
             else:
-                assert False, f"weird {status=}"
+                assert False, f"weird {status=}" #pragma: no cover
 
 #############################################################################
 #
@@ -426,12 +434,12 @@ class Pipe:
 
         return self
 
-    def __del__(self):
-        # close the pty
-        if getattr(self, "pty", None):
-            os.close(self.pty[0])
-            os.close(self.pty[1])
-            os.close(self.tty)
+    # def __del__(self):
+    #     # close the pty
+    #     if getattr(self, "pty", None):
+    #         os.close(self.pty[0])
+    #         os.close(self.pty[1])
+    #         os.close(self.tty)
 
     def write(self, conn, fp):
         _write_object(fp, self)
@@ -628,7 +636,6 @@ class Client:
 
         cmd = os.environ.get("INSTA_CMD", None)
         if cmd is not None:
-            debug(f"Messaging the server {cmd=}")
             _write_object(fp, cmd)
             sys.exit(0)
 
@@ -662,19 +669,21 @@ class Client:
 #############################################################################
 
 def start():
-    timeout = os.environ.get("INSTA_TIMEOUT", 10)
+    if not _disabled:
+        timeout = float(os.environ.get("INSTA_TIMEOUT", "10"))
 
-    global _worker
-    _worker = _server.start(timeout=timeout)
+        global _worker
+        _worker = _server.start(timeout=timeout)
 
-    return _worker
+        return _worker
 
 def done(exitcode=0):
     # signal the client we've finished and that it can safely pretend
     # this process has exited.
     #
     # May only be called from the worker (i.e., after start() has been called).
-    _worker.done(exitcode)
+    if not _disabled:
+        _worker.done(exitcode)
 
 @contextmanager
 def serve(autodone=True):
@@ -692,6 +701,8 @@ def serve(autodone=True):
         done()
 
 def _connect_or_serve():
+    _debug_write_pid("client")
+
     # try connecting on our socket; if fail, spawn a new server
     socket_path = _construct_socket_name()
     client = Client(socket_path)
@@ -718,4 +729,13 @@ def _connect_or_serve():
         # should be prewarmed until it's paused in start()
         return server
 
-_server = _connect_or_serve()
+_disabled = os.environ.get("INSTA_DISABLE", "no")
+if _disabled == "yes":
+    _disabled = True
+elif _disabled == "no":
+    _disabled = False
+else:
+    raise Exception(f'$INSTA_DISABLE environmental variable must be either "yes" or "no" (current: INSTA_DISABLE={_disabled})')
+
+if not _disabled:
+    _server = _connect_or_serve()
