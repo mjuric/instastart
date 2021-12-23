@@ -17,9 +17,12 @@ STDERR = 2
 _worker = None
 _server = None
 
+_name = None
 def _debug_write_pid(name):
     # debugging/profiling aid: write out our PID into a file in
     # $INSTA_PID_DIR directory
+    import instastart
+    instastart._name = name
     if "INSTA_PID_DIR" in os.environ:
         with open(os.path.join(os.environ["INSTA_PID_DIR"], f"{name}.pid"), "w") as fp:
             print(os.getpid(), file=fp)
@@ -345,8 +348,10 @@ class Worker:
             try:
                 self._sentry_loop(fp, pid)
             finally:
+#                import time
+#                time.sleep(1.)
                 conn.close()
-                os.exit(0)
+                sys.exit(0)
 
         assert False, "We should never exit this function" #pragma: no cover
 
@@ -443,21 +448,32 @@ class Pipe:
 
     def write(self, conn, fp):
         _write_object(fp, self)
-        socket.send_fds(conn, [ b'm' ], self.fds)
+
+        # pass on the master_fd as well, if we have a pty
+        fds = self.fds[:]
+        if self.pty:
+            fds.append(self.pty[0])
+
+        socket.send_fds(conn, [ b'm' ], fds)
 
     @staticmethod
     def receive(conn, fp):
         # called by the sentry to set up the worker process & connection
         self = _read_object(fp)
-        _, self.fds, _, _ = socket.recv_fds(conn, 10, maxfds=3)
+        _, fds, _, _ = socket.recv_fds(conn, 10, maxfds=4)
 
         # pty/tty variables
-        if self.tty is not None:    # means we have a tty.
-            self.pty = None         # these are not used on the worker
-            for fd in self.fds:     # one of the fds is our tty; pull it out
+        if len(fds) == 4:      # means we have a pty
+            for fd in fds:     # one of the fds is our tty; pull it out
                 if os.isatty(fd):
                     self.tty = fd
                     break
+            self.pty = (fds[3], self.tty)   # fds[3] is the master_fd; we need to keep it 
+                                            # open on the Sentry so we don't
+                                            # get SIGHUP-ed if the Client
+                                            # exits before us, closing
+                                            # master_fd.
+        self.fds = fds[:3]
 
         # apply the run specification to the current process
         sys.argv = self.argv

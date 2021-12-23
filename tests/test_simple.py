@@ -3,9 +3,11 @@ from ptyprocess import PtyProcessUnicode
 
 @contextlib.contextmanager
 def in_scripts_dir():
-    os.chdir("tests/scripts")
-    yield
-    os.chdir("../..")
+    try:
+        os.chdir("tests/scripts")
+        yield
+    finally:
+        os.chdir("../..")
 
 @pytest.fixture(scope="function")
 def env():
@@ -175,7 +177,44 @@ def wait_for(procs, states, timeout):
 
     raise TimeoutError() # pragma: no cover
 
+def find_coverage_atexit():
+    class Capture:
+        def __init__(self):
+            self.captured = []
+        def __eq__(self, other):
+            self.captured.append(other)
+            return False
+    
+    c = Capture()
+    import atexit
+    atexit.unregister(c)
+    for fun in c.captured:
+        print(fun)
+        print(fun.__module__)
+
+    for fun in c.captured:
+        if fun.__module__.startswith("coverage"):
+            return fun
+
+    return None
+
 def test_suspend_resume(env):
+    def _ex1():
+        print("EXIT1")
+
+    def _ex2():
+        print("EXIT2")
+
+    import atexit
+#    atexit.register(_ex1)
+#    atexit.register(_ex2)
+#    find_coverage_atexit()
+
+#    atx = find_coverage_atexit()
+#    atx()
+#    print("Exiting")
+#    os._exit(0)
+
     with in_scripts_dir():
         with wait_all(env) as env:
             # spin up a client + worker
@@ -205,7 +244,7 @@ def test_suspend_resume(env):
             p.expect_exact("Done, exiting.\r\n")
             p.wait()
 
-@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM, signal.SIGQUIT, signal.SIGKILL])
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM, signal.SIGQUIT])#, signal.SIGKILL])
 def test_intr(env, signum):
     with in_scripts_dir():
         with wait_all(env) as env:
