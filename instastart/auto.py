@@ -56,11 +56,15 @@ def _setproctitle(title):
     except ImportError:
         pass
 
+# for debugging -- flip this to True to keep STDERR connected to the console
+_keep_stderr = False
+
 def debug(*argv, **kwargs):
     # our own fast-ish logging routines (importing logging seems to add
     # ~15msec to runtime, tested on macOS/MBA)
-    kwargs['file'] = sys.stderr
-    return print(*argv, **kwargs)
+    if _keep_stderr:
+        kwargs['file'] = sys.stderr
+        return print(*argv, **kwargs)
 
 #############################################################################
 #   Pty management 
@@ -141,10 +145,12 @@ class Server:
             # Note: https://docs.python.org/3/faq/library.html#why-doesn-t-closing-sys-stdout-stdin-stderr-really-close-it
             os.close(0)
             os.close(1)
-            os.close(2)
+            if not _keep_stderr:
+                os.close(2)
             fd = os.open(self.log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
             os.dup2(fd, 1)
-            os.dup2(fd, 2)
+            if not _keep_stderr:
+                os.dup2(fd, 2)
             os.close(fd)
 
             # now fall through until we hit start() somewhere in __main__
@@ -187,6 +193,23 @@ class Server:
                 os.rename(spath, self.socket_path)
                 # debug(' done.')
 
+                # add a SIGCHLD handler so we reap the sentries as soon as
+                # they exit, avoiding accumulation of zombies. We don't
+                # double fork (reparenting children to init) for performance:
+                # for a large process (100GB+ of preloaded data in RAM) the
+                # fork itself takes awhile.
+                def _reap_children(signum, frame):
+                    debug("Reaping sentry")
+                    pid = -1
+                    while pid != 0:
+                        try:
+                            pid, exitstatus = os.waitpid(-1, os.WNOHANG)
+                        except ChildProcessError:
+                            pid = exitstatus = 0
+                        debug(f"waitpid returned {pid=} {exitstatus=}")
+
+                signal.signal(signal.SIGCHLD, _reap_children)
+
                 if self._readypipe is not None:
                     # debug('signaling on readypipe')
                     # signal to the reader the server is ready to accept connections
@@ -202,13 +225,13 @@ class Server:
                     except socket.timeout:
                         debug("Server timeout. Exiting")
                         sys.exit(0)
-                    # debug(f"Connection accepted")
+                    debug(f"Connection accepted")
 
                     # make our life easier & create a file-like object
                     fp = conn.makefile(mode='rwb', buffering=0)
 
                     cmd = _read_object(fp)
-                    # debug(f"{cmd=}")
+                    debug(f"{cmd=}")
                     if cmd == "stop":
                         # exit the listen loop
                         debug("Server received a command to exit. Exiting")
@@ -285,7 +308,8 @@ class Worker:
         # should have a pipe back to the sentry instead, message the sentry
         # and have the sentry message the client, b) switch the socket to use
         # datagrams.
-        _write_object(self._client_fp, ("exited", exitcode))
+        with os.fdopen(self.wrk_w, "wb", buffering=0) as fp:
+            _write_object(fp, ("exited", exitcode))
 
     def _spawn(self, conn, fp):
         # Fork the sentry and worker processes to execute the payload.
@@ -298,7 +322,9 @@ class Worker:
         # Returns only in the worker process.
 
         # load the run specification, and apply it to our process
+        debug(f"in spawn")
         pipe = Pipe.receive(conn, fp)
+        debug(f"received")
     
         os.setsid()
         if pipe.tty is not None:
@@ -306,22 +332,36 @@ class Worker:
             # controlling terminal
             fcntl.ioctl(pipe.tty, termios.TIOCSCTTY)
 
+        # receive SIGCHLD signals via a file descriptor. this way we can
+        # select() both on conn and child messages in _sentry_loop()
+        sig_r, sig_w = os.pipe()
+        os.set_blocking(sig_w, False)
+        signal.set_wakeup_fd(sig_w, warn_on_full_buffer=False)
+        def _chld(*args):
+            debug("got SIGCHLD")
+        signal.signal(signal.SIGCHLD, _chld)
+
         # the sentry will set up the child's process group and terminal.
         # while that's going on, the child should wait and not start
         # executeing the payload. We do this by having the child wait to
         # receive a message via a pipe.
         r, w = os.pipe()
-        
+        wrk_r, wrk_w = os.pipe()    # return messages from the worker (for done())
+
         # fork the worker process
+        debug(f"about to fork")
         pid = os.fork()
         if pid == 0:
             _debug_write_pid("worker")
             self._is_worker = True
             _setproctitle(f"[{' '.join(sys.argv)} :: worker/{pipe.pid}]")
 
+            os.close(sig_r)         # signal handling pipes
+            os.close(sig_w)
+            os.close(wrk_r)
             os.close(w)             # we'll only be reading
             conn.close()            # we won't be directly communicating to the client
-            self._client_fp = fp    # FIXME: massive hack, for communicating the done() msg to the client
+            self.wrk_w = wrk_w      # so done() can use it to message the sentry
 
             # wait until the sentry sets us up
             if os.read(r, 1) != b"x":
@@ -335,7 +375,8 @@ class Worker:
             _setproctitle(f"[{' '.join(sys.argv)} :: sentry/{pipe.pid}]")
 
             os.close(r)                 # we'll only be writing
-            
+            os.close(wrk_w)
+
             os.setpgid(pid, pid)        # start a new process group for the child
             if pipe.tty is not None:
                 os.tcsetpgrp(pipe.tty, pid)	# make the child's the foreground process group (so it receives tty input+signals)
@@ -346,16 +387,17 @@ class Worker:
             os.close(w)
 
             try:
-                self._sentry_loop(fp, pid)
+                self._sentry_loop(fp, sig_r, wrk_r, pid)
             finally:
-#                import time
-#                time.sleep(1.)
                 conn.close()
+                os.close(sig_r)
+                os.close(sig_w)
+                os.close(wrk_r)
                 sys.exit(0)
 
         assert False, "We should never exit this function" #pragma: no cover
 
-    def _sentry_loop(self, fp, pid):
+    def _sentry_loop(self, fp, sig_r, wrk_r, pid):
         # Loop here calling waitpid(-1, 0, WUNTRACED) to handle
         # the child's SIGSTOP (by SIGSTOP-ing the remote_pid) and death (just exit)
         # Really good explanation: https://stackoverflow.com/a/34845669
@@ -363,29 +405,92 @@ class Worker:
         #        periodically timing out and checking if conn is still open...
         #        Or, we could move all this into a SIGCHLD handler, and
         #        constantly listen on conn?
-        #        Actually, we should do this: https://docs.python.org/3/library/signal.html#signal.set_wakeup_fd
+        # Actually, we should do this:
+        # https://docs.python.org/3/library/signal.html#signal.set_wakeup_fd
+        confd = fp.fileno()
+        wrk_fp = os.fdopen(wrk_r, "rb", buffering=0)
+        fds = [ confd, sig_r, wrk_r ]
+        exited = False
         while True:
-            # debug(f"SENTRY: waitpid on {pid=}")
-            _, status = os.waitpid(pid, os.WUNTRACED | os.WCONTINUED)
-            # debug(f"SENTRY: waitpid returned {status=}")
-            # debug(f"SENTRY: {os.WIFSTOPPED(status)=} {os.WIFEXITED(status)=} {os.WIFSIGNALED(status)=} {os.WIFCONTINUED(status)=}")
-            if os.WIFSTOPPED(status):
-                # let the controller know we've stopped
-                _write_object(fp, ("stopped", 0))
-            elif os.WIFEXITED(status):
-                # we've exited. return the status back to the controller
-                _write_object(fp, ("exited", os.WEXITSTATUS(status)))
+            debug(f"about to select {fds=}")
+            rfds, _, _ = foo = select.select(fds, [], [])
+            debug(f"{foo=}")
+            debug(f"{confd=} {sig_r=} {wrk_r=}")
+            # with open("debug.log", "w") as ff:
+            #     print(foo, file=ff)
+            #     print(f"{confd=} {sig_r=} {wrk_fd=}", file=ff)
+
+            if confd in rfds:
+                debug("SENTRY: confd selected")
+                try:
+                    data = os.read(confd, 1024*1024)
+                except OSError:
+                    data = b''
+
+                debug(f"SENTRY: confd connection closed, {exited=} {data=}")
+                # the connection has been closed; the client has died w/o
+                # being able to shutdown cleanly. terminate the worker
+                # immediately, and exit.
+                if not exited:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
                 break
-            elif os.WIFSIGNALED(status):
-                # we've exited. return the status back to the controller
-                _write_object(fp, ("signaled", os.WTERMSIG(status)))
-                break
-            elif os.WIFCONTINUED(status):
-                # we've been continued after being stopped
-                # TODO: should we make sure the remote_pid is signaled to CONT?
-                pass
-            else:
-                assert False, f"weird {status=}" #pragma: no cover
+
+            if wrk_r in rfds:
+                # user-initiated exit (i.e., the user called done())
+                # emulate an exit here.
+                debug("SENTRY: about to read")
+                try:
+                    (cmd, exitstatus) = _read_object(wrk_fp)
+                except EOFError:
+                    cmd = "closed"
+
+                if cmd == "closed":
+                    fds.remove(wrk_r)
+                elif cmd == "exited":
+                    debug(f"SENTRY: DONE reading {cmd=} {exitstatus=}")
+                    assert cmd == "exited"
+
+                    _write_object(fp, ("exited", exitstatus))
+                    exited = True
+                    # we don't break out of the loop here, as we have to
+                    # stick around to reap the child
+#                    _, status = os.waitpid(pid, os.WUNTRACED | os.WCONTINUED)
+#                    debug(f"SENTRY: WAITPID finished")
+#                    break
+                else:
+                    assert False, f"Unknown command {cmd=}"
+
+            if sig_r in rfds:
+#            if True:
+                # empty the buffer (we only use this for signaling on the child)
+                dummy = os.read(sig_r, 1024*1024)
+                debug(f"{len(dummy)=}")
+
+                debug(f"SENTRY[{os.getpid()}]: waitpid on {pid=}")
+                _, status = os.waitpid(pid, os.WUNTRACED | os.WCONTINUED)
+                debug(f"SENTRY: WAITPID finished")
+                if exited:
+                    debug(f"Breaking out of the loop")
+                    break
+                # debug(f"SENTRY: waitpid returned {status=}")
+                # debug(f"SENTRY: {os.WIFSTOPPED(status)=} {os.WIFEXITED(status)=} {os.WIFSIGNALED(status)=} {os.WIFCONTINUED(status)=}")
+                if os.WIFSTOPPED(status):
+                    # let the controller know we've stopped
+                    _write_object(fp, ("stopped", 0))
+                elif os.WIFEXITED(status):
+                    # we've exited. return the status back to the controller
+                    _write_object(fp, ("exited", os.WEXITSTATUS(status)))
+                    break
+                elif os.WIFSIGNALED(status):
+                    # we've exited. return the status back to the controller
+                    _write_object(fp, ("signaled", os.WTERMSIG(status)))
+                    break
+                elif os.WIFCONTINUED(status):
+                    # we've been continued after being stopped
+                    # TODO: should we make sure the remote_pid is signaled to CONT?
+                    pass
+                else:
+                    assert False, f"weird {status=}" #pragma: no cover
 
 #############################################################################
 #
@@ -482,7 +587,11 @@ class Pipe:
         os.environ.update(self.environ)
 
         # File descriptors for STDIN/OUT/ERR
-        for src, dst in zip(self.fds, [STDIN, STDOUT, STDERR]):
+        if not _keep_stderr:
+            fdnums = [STDIN, STDOUT, STDERR]
+        else:
+            fdnums = [STDIN, STDOUT]
+        for src, dst in zip(self.fds, fdnums):
             os.dup2(src, dst)
 
         return self
@@ -737,6 +846,9 @@ def _connect_or_serve():
         # try connecting again
         ret = client.connect()
         if ret is not None:
+#            print("Napping for the debugger")
+#            import time
+#            time.sleep(400)
             sys.exit(ret)
         else:
             raise Exception("Uh-oh... Failed to connect to instastart background process!")

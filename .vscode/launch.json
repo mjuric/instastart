@@ -5,11 +5,20 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "Python: Attach using Process Id",
+            "type": "python",
+            "request": "attach",
+            "processId": "${command:pickProcess}"
+        },
+        {
             "name": "Pytest",
             "type": "python",
             "request": "launch",
             "module": "pytest",
-            "args": [ "--no-cov", "${file}::test_stop" ],
+            "args": [
+                "--no-cov",
+                "${file}::test_stop"
+            ],
             "cwd": "${workspaceFolder}"
         },
         {

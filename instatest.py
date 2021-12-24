@@ -29,6 +29,7 @@ if __name__ == "__main__":
         print("Here!")
         print(f"{sys.argv=}")
         print(f"{os.getcwd()=}")
+        print(f"{os.getpid()}")
         print(f"{os.environ['PWD']=}")
         print(f"{os.environ.get('FOOBAR', None)=}")
         run_tqdm()
