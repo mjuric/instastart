@@ -17,7 +17,6 @@ STDERR = 2
 _worker = None
 _server = None
 
-_name = None
 def _debug_write_pid(name):
     # debugging/profiling aid: write out our PID into a file in
     # $INSTA_PID_DIR directory
@@ -199,14 +198,14 @@ class Server:
                 # for a large process (100GB+ of preloaded data in RAM) the
                 # fork itself takes awhile.
                 def _reap_children(signum, frame):
-                    debug("Reaping sentry")
+                    # debug("Reaping sentry")
                     pid = -1
                     while pid != 0:
                         try:
                             pid, exitstatus = os.waitpid(-1, os.WNOHANG)
                         except ChildProcessError:
                             pid = exitstatus = 0
-                        debug(f"waitpid returned {pid=} {exitstatus=}")
+                        # debug(f"waitpid returned {pid=} {exitstatus=}")
 
                 signal.signal(signal.SIGCHLD, _reap_children)
 
@@ -322,9 +321,7 @@ class Worker:
         # Returns only in the worker process.
 
         # load the run specification, and apply it to our process
-        debug(f"in spawn")
         pipe = Pipe.receive(conn, fp)
-        debug(f"received")
     
         os.setsid()
         if pipe.tty is not None:
@@ -337,9 +334,7 @@ class Worker:
         sig_r, sig_w = os.pipe()
         os.set_blocking(sig_w, False)
         signal.set_wakeup_fd(sig_w, warn_on_full_buffer=False)
-        def _chld(*args):
-            debug("got SIGCHLD")
-        signal.signal(signal.SIGCHLD, _chld)
+        signal.signal(signal.SIGCHLD, lambda signum, frame: None)  # have to set a dummy handler, otherwise sig_w isn't woken up
 
         # the sentry will set up the child's process group and terminal.
         # while that's going on, the child should wait and not start
@@ -349,7 +344,6 @@ class Worker:
         wrk_r, wrk_w = os.pipe()    # return messages from the worker (for done())
 
         # fork the worker process
-        debug(f"about to fork")
         pid = os.fork()
         if pid == 0:
             _debug_write_pid("worker")
@@ -358,9 +352,9 @@ class Worker:
 
             os.close(sig_r)         # signal handling pipes
             os.close(sig_w)
-            os.close(wrk_r)
             os.close(w)             # we'll only be reading
             conn.close()            # we won't be directly communicating to the client
+            os.close(wrk_r)
             self.wrk_w = wrk_w      # so done() can use it to message the sentry
 
             # wait until the sentry sets us up
@@ -393,47 +387,46 @@ class Worker:
                 os.close(sig_r)
                 os.close(sig_w)
                 os.close(wrk_r)
+                # FIXME: this should really be os._exit(), otherwise
+                # except/finally branches may be triggered in the user's
+                # code. Keeping sys.exit() for now as coverage.py needs to
+                # run atexit handlers.
                 sys.exit(0)
 
         assert False, "We should never exit this function" #pragma: no cover
 
     def _sentry_loop(self, fp, sig_r, wrk_r, pid):
-        # Loop here calling waitpid(-1, 0, WUNTRACED) to handle
-        # the child's SIGSTOP (by SIGSTOP-ing the remote_pid) and death (just exit)
-        # Really good explanation: https://stackoverflow.com/a/34845669
-        # FIXME: We should handle the case where remote_pid is killed, by
-        #        periodically timing out and checking if conn is still open...
-        #        Or, we could move all this into a SIGCHLD handler, and
-        #        constantly listen on conn?
-        # Actually, we should do this:
-        # https://docs.python.org/3/library/signal.html#signal.set_wakeup_fd
-        confd = fp.fileno()
-        wrk_fp = os.fdopen(wrk_r, "rb", buffering=0)
+        # Await for signals or messages about the worker, as well as whether
+        # client is alive.
+        confd = fp.fileno() # client control conection
+        wrk_fp = os.fdopen(wrk_r, "rb", buffering=0) # worker pipe for done()
         fds = [ confd, sig_r, wrk_r ]
-        exited = False
-        while True:
-            debug(f"about to select {fds=}")
+        exited = False # did the worker "exit" via a call to done()
+        while fds:
+            # debug(f"about to select {fds=}")
             rfds, _, _ = foo = select.select(fds, [], [])
-            debug(f"{foo=}")
-            debug(f"{confd=} {sig_r=} {wrk_r=}")
-            # with open("debug.log", "w") as ff:
-            #     print(foo, file=ff)
-            #     print(f"{confd=} {sig_r=} {wrk_fd=}", file=ff)
+            # debug(f"{foo=}")
+            # debug(f"{confd=} {sig_r=} {wrk_r=}")
 
             if confd in rfds:
-                debug("SENTRY: confd selected")
+                # this should only happen if the connection has been closed.
+                # Either the client has died w/o being able to shutdown
+                # cleanly (in which case we'll terminate the worker)
+                # OR the client has exited because the worker exited via
+                # done(). Either way, we'll stick around to reap the worker.
+
+                # debug("SENTRY: confd selected")
                 try:
                     data = os.read(confd, 1024*1024)
                 except OSError:
                     data = b''
+                assert data == b''
 
-                debug(f"SENTRY: confd connection closed, {exited=} {data=}")
-                # the connection has been closed; the client has died w/o
-                # being able to shutdown cleanly. terminate the worker
-                # immediately, and exit.
+                #debug(f"SENTRY: confd connection closed, {exited=} {data=}")
                 if not exited:
                     os.killpg(os.getpgid(pid), signal.SIGKILL)
-                break
+                
+                fds.remove(confd)
 
             if wrk_r in rfds:
                 # user-initiated exit (i.e., the user called done())
@@ -445,19 +438,18 @@ class Worker:
                     cmd = "closed"
 
                 if cmd == "closed":
+                    # the worker process has exited & closed the pipe
                     fds.remove(wrk_r)
                 elif cmd == "exited":
+                    # the worker process has called done(). Message the
+                    # client but remain looping here until the worker
+                    # actually terminates.
                     debug(f"SENTRY: DONE reading {cmd=} {exitstatus=}")
                     assert cmd == "exited"
 
                     _write_object(fp, ("exited", exitstatus))
                     exited = True
-                    # we don't break out of the loop here, as we have to
-                    # stick around to reap the child
-#                    _, status = os.waitpid(pid, os.WUNTRACED | os.WCONTINUED)
-#                    debug(f"SENTRY: WAITPID finished")
-#                    break
-                else:
+                else: #pragma: no cover
                     assert False, f"Unknown command {cmd=}"
 
             if sig_r in rfds:

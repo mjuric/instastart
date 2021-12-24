@@ -244,7 +244,7 @@ def test_suspend_resume(env):
             p.expect_exact("Done, exiting.\r\n")
             p.wait()
 
-@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM, signal.SIGQUIT])#, signal.SIGKILL])
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM, signal.SIGQUIT, signal.SIGKILL])
 def test_intr(env, signum):
     with in_scripts_dir():
         with wait_all(env) as env:
