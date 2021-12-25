@@ -177,27 +177,6 @@ def wait_for(procs, states, timeout):
 
     raise TimeoutError() # pragma: no cover
 
-def find_coverage_atexit():
-    class Capture:
-        def __init__(self):
-            self.captured = []
-        def __eq__(self, other):
-            self.captured.append(other)
-            return False
-    
-    c = Capture()
-    import atexit
-    atexit.unregister(c)
-    for fun in c.captured:
-        print(fun)
-        print(fun.__module__)
-
-    for fun in c.captured:
-        if fun.__module__.startswith("coverage"):
-            return fun
-
-    return None
-
 def test_suspend_resume(env):
     with in_scripts_dir():
         with wait_all(env) as env:
@@ -228,7 +207,7 @@ def test_suspend_resume(env):
             p.expect_exact("Done, exiting.\r\n")
             p.wait()
 
-@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM, signal.SIGQUIT, signal.SIGKILL])
+@pytest.mark.parametrize("signum", [signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGQUIT, signal.SIGKILL])
 def test_intr(env, signum):
     with in_scripts_dir():
         with wait_all(env) as env:
@@ -263,7 +242,7 @@ def test_ctrl_d(env):
 
             # send CTRL-D to the client, and see if it will exit
             p.sendeof()
-            
+
             p.expect_exact("Done, exiting.\r\n")
             p.wait()
 

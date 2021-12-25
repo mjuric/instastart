@@ -635,7 +635,8 @@ class Client:
             # received output
             if master_fd in rfds:
                 # Some OSes signal EOF by returning an empty byte string,
-                # some throw OSErrors.
+                # some (incl. Linux) throw OSErrors. EOF can happen if
+                # the client closes all pty file descriptors.
                 try:
                     data = os.read(master_fd, 1024*1024)
                 except OSError:
