@@ -578,6 +578,36 @@ class Pipe:
 
         return self
 
+def _run_coverage_py_atexit(): #pragma: no cover
+    # a hack to find coverage.py atexit function, and call
+    # it explicitly before a program terminates.
+    class Capture:
+        def __init__(self):
+            self.captured = []
+        def __eq__(self, other):
+            self.captured.append(other)
+            return False
+
+    # fantastic hack from https://stackoverflow.com/a/63029332
+    c = Capture()
+    import atexit
+    atexit.unregister(c)
+    for fun in c.captured:
+        print(fun)
+        print(fun.__module__)
+
+    for fun in c.captured:
+        if fun.__module__.startswith("coverage"):
+            _atexit = fun
+            break
+    else:
+        return
+
+    # call coverage.py's atexit
+    _atexit()
+
+    return None
+
 class Client:
     socket_path = None   # path to the UNIX socket we connect to
 
@@ -690,8 +720,9 @@ class Client:
                         termios.tcsetattr(tty_fd, tty.TCSAFLUSH, termios_attr)	# restore tty back from the raw mode
                     # then restore its default handler and commit a copycat suicide
                     signal.signal(signum, signal.SIG_DFL)
-                    os.kill(os.getpid(), signum)
-                else:
+                    _run_coverage_py_atexit()
+                    os.kill(os.getpid(), signum) #pragma: no cover
+                else: #pragma: no cover
                     assert 0, "unknown control event {event}"
 
     def _communicate(self, fp, pipe, remote_pid):
@@ -756,10 +787,10 @@ class Client:
         if pipe.pty:
             # set up the SIGWINCH handler which copies terminal window changes
             # to the pty
-            signal.signal(
-                signal.SIGWINCH,
-                lambda signum, frame: _setwinsize(pipe.pty[1], _getwinsize(pipe.tty))
-            )
+            def _sigwinch_handler(signum, frame):
+                _setwinsize(pipe.pty[1], _getwinsize(pipe.tty))
+
+            signal.signal(signal.SIGWINCH, _sigwinch_handler)
         pipe.write(client, fp)
 
         # get the child PID
