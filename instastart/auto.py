@@ -52,7 +52,7 @@ def _setproctitle(title):
     try:
         import setproctitle
         setproctitle.setproctitle(title)
-    except ImportError:
+    except ImportError: #pragma: no cover
         pass
 
 # for debugging -- flip this to True to keep STDERR connected to the console
@@ -309,6 +309,7 @@ class Worker:
         # datagrams.
         with os.fdopen(self.wrk_w, "wb", buffering=0) as fp:
             _write_object(fp, ("exited", exitcode))
+        # note: as a side-effect, the above also closes the wrk_w fd
 
     def _spawn(self, conn, fp):
         # Fork the sentry and worker processes to execute the payload.
@@ -386,7 +387,6 @@ class Worker:
                 conn.close()
                 os.close(sig_r)
                 os.close(sig_w)
-                os.close(wrk_r)
                 # FIXME: this should really be os._exit(), otherwise
                 # except/finally branches may be triggered in the user's
                 # code. Keeping sys.exit() for now as coverage.py needs to
@@ -395,45 +395,40 @@ class Worker:
 
         assert False, "We should never exit this function" #pragma: no cover
 
-    def _sentry_loop(self, fp, sig_r, wrk_r, pid):
-        # Await for signals or messages about the worker, as well as whether
-        # client is alive.
-        confd = fp.fileno() # client control conection
-        wrk_fp = os.fdopen(wrk_r, "rb", buffering=0) # worker pipe for done()
-        fds = [ confd, sig_r, wrk_r ]
-        exited = False # did the worker "exit" via a call to done()
+    def _sentry_loop(self, client_fp, sig_r, wrk_r, pid):
+        # We monitor for three things here:
+        # * client_fp, the socket to the client. If it's down, the
+        #   client has exited and we make sure the worker exits as well.
+        # * wrk_r, the pipe from the worker. If the worker sends us an
+        #   "exited" message, we pass it to the client then make sure
+        #   the worker exits.
+        # * sig_r, the SIGCHLD messages. We pass these on to the client.
+        #
+        client_fd = client_fp.fileno() # client control conection
+        fds = [ client_fd, sig_r, wrk_r ]
+        done = False # did the worker "exit" via a call to done()
         while fds:
-            # debug(f"about to select {fds=}")
             rfds, _, _ = foo = select.select(fds, [], [])
-            # debug(f"{foo=}")
-            # debug(f"{confd=} {sig_r=} {wrk_r=}")
 
-            if confd in rfds:
-                # this should only happen if the connection has been closed.
-                # Either the client has died w/o being able to shutdown
-                # cleanly (in which case we'll terminate the worker)
-                # OR the client has exited because the worker exited via
-                # done(). Either way, we'll stick around to reap the worker.
-
-                # debug("SENTRY: confd selected")
+            if client_fd in rfds:
+                # The client has died. If the worker isn't already marked as
+                # done, kill it with a SIGKILL.
                 try:
-                    data = os.read(confd, 1024*1024)
+                    data = os.read(client_fd, 1024*1024)
                 except OSError:
                     data = b''
                 assert data == b''
 
-                #debug(f"SENTRY: confd connection closed, {exited=} {data=}")
-                if not exited:
+                fds.remove(client_fd)
+
+                if not done:
                     os.killpg(os.getpgid(pid), signal.SIGKILL)
-                
-                fds.remove(confd)
 
             if wrk_r in rfds:
-                # user-initiated exit (i.e., the user called done())
-                # emulate an exit here.
-                debug("SENTRY: about to read")
+                # worker process exit, or a user-initiated exit (via done()).
                 try:
-                    (cmd, exitstatus) = _read_object(wrk_fp)
+                    with os.fdopen(os.dup(wrk_r), "rb", buffering=0) as wrk_fp:
+                        (cmd, exitstatus) = _read_object(wrk_fp)
                 except EOFError:
                     cmd = "closed"
 
@@ -447,35 +442,30 @@ class Worker:
                     debug(f"SENTRY: DONE reading {cmd=} {exitstatus=}")
                     assert cmd == "exited"
 
-                    _write_object(fp, ("exited", exitstatus))
-                    exited = True
+                    _write_object(client_fp, ("exited", exitstatus))
+                    done = True
                 else: #pragma: no cover
                     assert False, f"Unknown command {cmd=}"
 
             if sig_r in rfds:
-#            if True:
                 # empty the buffer (we only use this for signaling on the child)
-                dummy = os.read(sig_r, 1024*1024)
-                debug(f"{len(dummy)=}")
+                os.read(sig_r, 1024*1024)
 
-                debug(f"SENTRY[{os.getpid()}]: waitpid on {pid=}")
+                # wait for child status
                 _, status = os.waitpid(pid, os.WUNTRACED | os.WCONTINUED)
-                debug(f"SENTRY: WAITPID finished")
-                if exited:
-                    debug(f"Breaking out of the loop")
+                if done:
                     break
-                # debug(f"SENTRY: waitpid returned {status=}")
-                # debug(f"SENTRY: {os.WIFSTOPPED(status)=} {os.WIFEXITED(status)=} {os.WIFSIGNALED(status)=} {os.WIFCONTINUED(status)=}")
+
                 if os.WIFSTOPPED(status):
                     # let the controller know we've stopped
-                    _write_object(fp, ("stopped", 0))
+                    _write_object(client_fp, ("stopped", 0))
                 elif os.WIFEXITED(status):
                     # we've exited. return the status back to the controller
-                    _write_object(fp, ("exited", os.WEXITSTATUS(status)))
+                    _write_object(client_fp, ("exited", os.WEXITSTATUS(status)))
                     break
                 elif os.WIFSIGNALED(status):
                     # we've exited. return the status back to the controller
-                    _write_object(fp, ("signaled", os.WTERMSIG(status)))
+                    _write_object(client_fp, ("signaled", os.WTERMSIG(status)))
                     break
                 elif os.WIFCONTINUED(status):
                     # we've been continued after being stopped
@@ -620,6 +610,7 @@ class Client:
                     data = os.read(master_fd, 1024*1024)
                 except OSError:
                     data = b""
+                debug(f"CLIENT: read output {data=}")
                 if not data:  # Reached EOF.
                     # debug("CLIENT: zero read on master_fd")
                     fds.remove(master_fd)
@@ -629,6 +620,7 @@ class Client:
             # received input
             if tty_fd in rfds:
                 data = os.read(tty_fd, 1024*1024)
+                debug(f"CLIENT: read input {data=}")
                 if not data:
                     fds.remove(tty_fd)
                 else:
@@ -838,9 +830,9 @@ def _connect_or_serve():
         # try connecting again
         ret = client.connect()
         if ret is not None:
-#            print("Napping for the debugger")
-#            import time
-#            time.sleep(400)
+            # print("Napping for the debugger")
+            # import time
+            # time.sleep(400)
             sys.exit(ret)
         else:
             raise Exception("Uh-oh... Failed to connect to instastart background process!")

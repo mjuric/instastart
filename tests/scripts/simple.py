@@ -16,3 +16,5 @@ if __name__ == "__main__":
 
     # this shouldn't appear in the output
     print("Exiting", file=sys.stderr)
+    import time
+    time.sleep(0.5)

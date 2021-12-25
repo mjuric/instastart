@@ -199,22 +199,6 @@ def find_coverage_atexit():
     return None
 
 def test_suspend_resume(env):
-    def _ex1():
-        print("EXIT1")
-
-    def _ex2():
-        print("EXIT2")
-
-    import atexit
-#    atexit.register(_ex1)
-#    atexit.register(_ex2)
-#    find_coverage_atexit()
-
-#    atx = find_coverage_atexit()
-#    atx()
-#    print("Exiting")
-#    os._exit(0)
-
     with in_scripts_dir():
         with wait_all(env) as env:
             # spin up a client + worker
@@ -266,3 +250,20 @@ def test_intr(env, signum):
 
             # verify the correct signal killed the process
             assert (p.exitstatus, p.signalstatus) == (None, signum)
+
+def test_ctrl_d(env):
+    with in_scripts_dir():
+        with wait_all(env) as env:
+            # spin up a client + worker
+            p = pexpect.spawn(f"{sys.executable} echo.py", env=env, encoding='utf-8')
+            p.expect_exact("> ")
+
+            client, worker = get_pids(env["INSTA_PID_DIR"], "client", "worker")
+            pcli, pwrk = psutil.Process(client), psutil.Process(worker)
+
+            # send CTRL-D to the client, and see if it will exit
+            p.sendeof()
+            
+            p.expect_exact("Done, exiting.\r\n")
+            p.wait()
+
