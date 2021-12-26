@@ -526,7 +526,7 @@ class Worker:
 
 class Terminal:
     master = None       # pty master
-    input = None        # set to 0 if STDIN is connected to a tty
+#    input = None        # set to 0 if STDIN is connected to a tty
     tty = None          # the client's controlling tty
     termios = None      # the client's tty termios attributes
 
@@ -537,11 +537,12 @@ class Terminal:
 
         # see if we're connected to a tty
         fd = next((fd for fd in [STDIN, STDOUT, STDERR] if os.isatty(fd)), None)
-        if fd == 0:
-            self.input = 0
+#        if fd == 0:
+#            self.input = 0
 
         if fd is not None:
-            self.tty = fd
+            # open a fd to our tty, independent of STDIN/OUT/ERR
+            self.tty = os.open(os.ttyname(fd), os.O_RDWR)
 
             # open and set up a pty
             self.master, slave = os.openpty()
@@ -567,12 +568,12 @@ class Terminal:
         return self.master is not None
 
     def setraw(self):
-        if self.input is not None:
-            tty.setraw(self.input)
+        if self.tty is not None:
+            tty.setraw(self.tty)
 
     def reset(self):
-        if self.input is not None:
-            termios.tcsetattr(self.input, tty.TCSAFLUSH, self.termios)
+        if self.tty is not None:
+            termios.tcsetattr(self.tty, tty.TCSAFLUSH, self.termios)
 
 class RunSpec:
     # specification of a worker run. Things like argv, cwd, environ, and file
@@ -666,7 +667,7 @@ class Client:
     def __init__(self, socket_path) -> None:
         self.socket_path = socket_path
 
-    def _communicate_loop(self, master_fd, stdin_fd, control_fp, termios_attr, remote_pid):
+    def _communicate_loop(self, master_fd, tty_fd, control_fp, termios_attr, remote_pid):
         """Copy and control loop
         Copies
                 pty master -> standard output   (master_read)
@@ -677,7 +678,7 @@ class Client:
         control_fd = control_fp.fileno()
         fds = [ control_fd ]
         if master_fd is not None: fds.append(master_fd)
-        if stdin_fd is not None: fds.append(stdin_fd)
+        if tty_fd is not None: fds.append(tty_fd)
         
         # debug(f"{fds=} {master_fd=} {tty_fd=}")
         while fds:
@@ -698,14 +699,14 @@ class Client:
                     # debug("CLIENT: zero read on master_fd")
                     fds.remove(master_fd)
                 else:
-                    os.write(stdin_fd, data)
+                    os.write(tty_fd, data)
 
             # received input
-            if stdin_fd in rfds:
-                data = os.read(stdin_fd, 1024*1024)
+            if tty_fd in rfds:
+                data = os.read(tty_fd, 1024*1024)
 #                debug(f"CLIENT: read input {data=}")
                 if not data:
-                    fds.remove(stdin_fd)
+                    fds.remove(tty_fd)
                 else:
                     _writen(master_fd, data)
 
@@ -716,12 +717,12 @@ class Client:
                 event, data = _read_object(control_fp)
                 # debug(f"CLIENT: received {event=}")
                 if event == "stopped":
-                    if stdin_fd is not None:
+                    if tty_fd is not None:
                         # it's possible we've been backrounded by the time we got here,
                         # so ignore SIGTTOU while mode-setting. This can happen if someone sent
                         # us (the client) an explicit SIGTSTP.
                         signal.signal(signal.SIGTTOU, signal.SIG_IGN)
-                        termios.tcsetattr(stdin_fd, tty.TCSAFLUSH, termios_attr)	# restore tty
+                        termios.tcsetattr(tty_fd, tty.TCSAFLUSH, termios_attr)	# restore tty
                         signal.signal(signal.SIGTTOU, signal.SIG_DFL)
                         # debug("CLIENT: Putting us to sleep")
                         # os.kill(os.getpid(), signal.SIGSTOP)			# put ourselves to sleep
@@ -730,12 +731,12 @@ class Client:
                     # this is where we sleep....
                     # ... and continue when we're awoken by SIGCONT (e.g., 'fg' in the shell)
 
-                    if stdin_fd is not None:
+                    if tty_fd is not None:
      	                # debug("CLIENT: Awake again")
-                        tty.setraw(stdin_fd)					# turn the STDIN raw again
+                        tty.setraw(tty_fd)					# turn the STDIN raw again
 
                         # set terminal size (in case it changed while we slept)
-                        s = fcntl.ioctl(stdin_fd, termios.TIOCGWINSZ, '\0'*8)
+                        s = fcntl.ioctl(tty_fd, termios.TIOCGWINSZ, '\0'*8)
                         fcntl.ioctl(master_fd, termios.TIOCSWINSZ, s)
 
                     # FIXME: we should message the sentry to do this (pid race condition!)
@@ -769,8 +770,8 @@ class Client:
                     return data # data is the exitstatus
                 elif event == "signaled":
                     signum = data  # data is the signal that terminated the worker
-                    if stdin_fd is not None:
-                        termios.tcsetattr(stdin_fd, tty.TCSAFLUSH, termios_attr)	# restore tty back from the raw mode
+                    if tty_fd is not None:
+                        termios.tcsetattr(tty_fd, tty.TCSAFLUSH, termios_attr)	# restore tty back from the raw mode
                     # then restore its default handler and commit a copycat suicide
                     signal.signal(signum, signal.SIG_DFL)
                     _run_coverage_py_atexit()
@@ -785,8 +786,12 @@ class Client:
             # worker
             term.setraw()
 
-            # Now enter the communication forwarding loop
-            return self._communicate_loop(term.master, term.input, fp, term.termios, remote_pid)
+            # Now enter the communication forwarding loop.
+            # Note: why do we listen on term.tty even if the process has
+            # STDIN redirected to a pipe/file? Because the process can still
+            # regain access to the tty by opening /dev/tty. We therefore must
+            # forward all tty input to the pty, to cover for that eventuallity.
+            return self._communicate_loop(term.master, term.tty, fp, term.termios, remote_pid)
         finally:
             # restore our console
             term.reset()
