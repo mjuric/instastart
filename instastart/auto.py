@@ -55,15 +55,44 @@ def _setproctitle(title):
     except ImportError: #pragma: no cover
         pass
 
-# for debugging -- flip this to True to keep STDERR connected to the console
-_keep_stderr = False
+class TimestampedOutput:
+    out = None
+    name = ""
+
+    def __init__(self, out, name):
+        self.out = out
+        self.name = name
+        self._at_line_start = True
+
+    def set_name(self, name):
+        self.name = name
+
+    def write(self, text):
+        import datetime
+        # add timestamps to beginnings of lines
+#        ts = f'{datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S.%f %Z")} '
+        ts = f'{datetime.datetime.now().strftime("%b %d %H:%M:%S.%f")} '
+        if self.name:
+            ts = ts + f'{self.name}[{os.getpid()}] '
+
+        if self._at_line_start:
+            text = ts + text
+        lineend = text.endswith('\n')
+        text = text.replace('\n', "\n" + ts)
+        if lineend:
+            text = text[:-len(ts)]
+        self._at_line_start = lineend
+
+        self.out.write(text)
+
+    def __getattr__(self, name):
+        return getattr(self. out, name)
 
 def debug(*argv, **kwargs):
     # our own fast-ish logging routines (importing logging seems to add
     # ~15msec to runtime, tested on macOS/MBA)
-    if _keep_stderr:
-        kwargs['file'] = sys.stderr
-        return print(*argv, **kwargs)
+    kwargs['file'] = sys.stderr
+    return print(*argv, **kwargs)
 
 #############################################################################
 #   Pty management 
@@ -140,12 +169,21 @@ class Server:
             os.setsid()
 
             # redirect the server output to a log file (/dev/null, by
-            # default). Note that the sentry will inherit these. Also close stdin.
+            # default). Note that the sentry will inherit these.
             fd = os.open(self.log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
             os.dup2(fd, 1)
             os.dup2(fd, 2)
             os.close(fd)
-            os.close(0)
+            # We don't close stdin, but redirect it to /dev/null. If we
+            # closed it, a subsequent os.open() or os.pipe() may allocate
+            # fd=0 to some random file/pipe, thus wreaking havoc. (learned
+            # the hard way!)
+            fd = os.open(os.devnull, os.O_RDONLY)
+            os.dup2(fd, 0)
+            os.close(fd)
+            # customize stdout/stderr to prepend timestamps
+            sys.stdout = TimestampedOutput(sys.stdout, "server")
+            sys.stderr = TimestampedOutput(sys.stderr, "server")
 
             # now fall through until we hit start() somewhere in __main__
             self._readypipe = _w
@@ -235,6 +273,8 @@ class Server:
                         child_pid = os.fork()
                         if child_pid == 0:
                             _debug_write_pid("sentry")
+                            sys.stdout.set_name("sentry")
+                            sys.stderr.set_name("sentry")
                             # Child process -- this is where the work gets done
                             sock.close()
                             return Worker(conn, fp)
@@ -274,6 +314,7 @@ class Worker:
             # we've received an exception or something similar
             if not self._is_worker:
                 sys.exit(0)
+                #raise Exception("Making some noise")
 
     def done(self, exitcode=0):
         # signal the client we've finished and that it can safely pretend
@@ -332,6 +373,8 @@ class Worker:
         pid = os.fork()
         if pid == 0:
             _debug_write_pid("worker")
+            sys.stdout.set_name("worker")
+            sys.stderr.set_name("worker")
             self._is_worker = True
 
             conn.close()
@@ -339,9 +382,12 @@ class Worker:
             os.close(wrk_r)
             if rs.master is not None:
                 os.close(rs.master)
+                os.close(rs.slave)
             self.wrk_w = wrk_w      # so done() can use it to message the sentry
 
             # set up and run
+            sys.stdout = sys.__stdout__
+            sys.stderr = sys.__stderr__
             rs.apply()
             _setproctitle(f"[{' '.join(sys.argv)} :: worker/{rs.client_pid}]")
 
@@ -370,8 +416,6 @@ class Worker:
             signal.signal(signal.SIGCHLD, lambda signum, frame: None)  # have to set a dummy handler, otherwise sig_w isn't woken up
 
             os.setpgid(pid, pid)        # start a new process group for the child
-
-            # terminal management
             if rs.master is not None:
                 os.tcsetpgrp(rs.slave, pid)                # make the child's the foreground process group (so it receives tty input+signals)
                 os.close(rs.slave)
@@ -489,6 +533,7 @@ class Terminal:
     @staticmethod
     def construct():
         self = Terminal()
+        slave = None
 
         # see if we're connected to a tty
         fd = next((fd for fd in [STDIN, STDOUT, STDERR] if os.isatty(fd)), None)
@@ -648,7 +693,7 @@ class Client:
                     data = os.read(master_fd, 1024*1024)
                 except OSError:
                     data = b""
-                debug(f"CLIENT: read output {data=}")
+#                debug(f"CLIENT: read output {data=}")
                 if not data:  # Reached EOF.
                     # debug("CLIENT: zero read on master_fd")
                     fds.remove(master_fd)
@@ -658,7 +703,7 @@ class Client:
             # received input
             if stdin_fd in rfds:
                 data = os.read(stdin_fd, 1024*1024)
-                debug(f"CLIENT: read input {data=}")
+#                debug(f"CLIENT: read input {data=}")
                 if not data:
                     fds.remove(stdin_fd)
                 else:
@@ -789,7 +834,8 @@ class Client:
         term, slave = Terminal.construct()
         rs = RunSpec.construct(term.master, slave)
         rs.write(server, fp)
-        os.close(slave)
+        if slave is not None:
+            os.close(slave)
 
         # get the worker PID
         remote_pid = _read_object(fp)

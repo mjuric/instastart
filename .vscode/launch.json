@@ -17,7 +17,7 @@
             "module": "pytest",
             "args": [
                 "--no-cov",
-                "${file}::test_stop"
+                "tests/test_simple.py::test_script[simple.py]"
             ],
             "cwd": "${workspaceFolder}"
         },
