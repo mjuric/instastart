@@ -139,18 +139,13 @@ class Server:
             # funny with the tty.
             os.setsid()
 
-            # close whatever we've had open for stdin/out/err, and redirect
-            # the server output to a log file (/dev/null, by default).
-            # Note: https://docs.python.org/3/faq/library.html#why-doesn-t-closing-sys-stdout-stdin-stderr-really-close-it
-            os.close(0)
-            os.close(1)
-            if not _keep_stderr:
-                os.close(2)
+            # redirect the server output to a log file (/dev/null, by
+            # default). Note that the sentry will inherit these. Also close stdin.
             fd = os.open(self.log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
             os.dup2(fd, 1)
-            if not _keep_stderr:
-                os.dup2(fd, 2)
+            os.dup2(fd, 2)
             os.close(fd)
+            os.close(0)
 
             # now fall through until we hit start() somewhere in __main__
             self._readypipe = _w
@@ -320,45 +315,37 @@ class Worker:
         # See docs/implementation.md for details.
         #
         # Returns only in the worker process.
-
-        # load the run specification, and apply it to our process
-        pipe = Pipe.receive(conn, fp)
-    
         os.setsid()
-        if pipe.tty is not None:
-            # make us the session leader, and make the tty our 
-            # controlling terminal
-            fcntl.ioctl(pipe.tty, termios.TIOCSCTTY)
 
-        # receive SIGCHLD signals via a file descriptor. this way we can
-        # select() both on conn and child messages in _sentry_loop()
-        sig_r, sig_w = os.pipe()
-        os.set_blocking(sig_w, False)
-        signal.set_wakeup_fd(sig_w, warn_on_full_buffer=False)
-        signal.signal(signal.SIGCHLD, lambda signum, frame: None)  # have to set a dummy handler, otherwise sig_w isn't woken up
+        r, w = os.pipe()            # block the worker while sentry does the setup
+        wrk_r, wrk_w = os.pipe()    # worker -> sentry messaging (for done())
 
-        # the sentry will set up the child's process group and terminal.
-        # while that's going on, the child should wait and not start
-        # executeing the payload. We do this by having the child wait to
-        # receive a message via a pipe.
-        r, w = os.pipe()
-        wrk_r, wrk_w = os.pipe()    # return messages from the worker (for done())
+        # get our client's id string; used by _setproctitle to make it
+        # easy to identify which processes are related to a given client
+        rs = RunSpec.receive(conn, fp)
+
+        # make the pty our controlling terminal, if there is one
+        if rs.master is not None:
+            fcntl.ioctl(rs.slave, termios.TIOCSCTTY)
 
         # fork the worker process
         pid = os.fork()
         if pid == 0:
             _debug_write_pid("worker")
             self._is_worker = True
-            _setproctitle(f"[{' '.join(sys.argv)} :: worker/{pipe.pid}]")
 
-            os.close(sig_r)         # signal handling pipes
-            os.close(sig_w)
-            os.close(w)             # we'll only be reading
-            conn.close()            # we won't be directly communicating to the client
+            conn.close()
+            os.close(w)
             os.close(wrk_r)
+            if rs.master is not None:
+                os.close(rs.master)
             self.wrk_w = wrk_w      # so done() can use it to message the sentry
 
-            # wait until the sentry sets us up
+            # set up and run
+            rs.apply()
+            _setproctitle(f"[{' '.join(sys.argv)} :: worker/{rs.client_pid}]")
+
+            # wait until the sentry sets us up before continuing
             if os.read(r, 1) != b"x":
                 raise Exception("[worker] sentry closed the pipe w/o starting us.") # pragma: no cover
             os.close(r)
@@ -366,15 +353,28 @@ class Worker:
             # return to __main__ to run the payload
             return
         else:
-            # change name to denote we're the sentry
-            _setproctitle(f"[{' '.join(sys.argv)} :: sentry/{pipe.pid}]")
-
-            os.close(r)                 # we'll only be writing
+            os.close(rs.fds[0])
+            os.close(rs.fds[1])
+            os.close(rs.fds[2])
+            os.close(r)
             os.close(wrk_w)
 
+            # change name to denote we're the sentry
+            _setproctitle(f"[{' '.join(sys.argv)} :: sentry/{rs.client_pid}]")
+
+            # receive SIGCHLD signals via a file descriptor. this way we can
+            # select() both on conn and child messages in _sentry_loop()
+            sig_r, sig_w = os.pipe()
+            os.set_blocking(sig_w, False)
+            signal.set_wakeup_fd(sig_w, warn_on_full_buffer=False)
+            signal.signal(signal.SIGCHLD, lambda signum, frame: None)  # have to set a dummy handler, otherwise sig_w isn't woken up
+
             os.setpgid(pid, pid)        # start a new process group for the child
-            if pipe.tty is not None:
-                os.tcsetpgrp(pipe.tty, pid)	# make the child's the foreground process group (so it receives tty input+signals)
+
+            # terminal management
+            if rs.master is not None:
+                os.tcsetpgrp(rs.slave, pid)                # make the child's the foreground process group (so it receives tty input+signals)
+                os.close(rs.slave)
 
             _write_object(fp, pid)      # send the child's PID back to the client
 
@@ -480,101 +480,108 @@ class Worker:
 #
 #############################################################################
 
-class Pipe:
-    tty = None  # out tty (Client: real tty; Worker: the slave_fd of the pty)
-    pty = None  # Used only on the Client, the pty we've set up for the Worker
-    termios = None # original termios attributes of the Client's tty
+class Terminal:
+    master = None       # pty master
+    input = None        # set to 0 if STDIN is connected to a tty
+    tty = None          # the client's controlling tty
+    termios = None      # the client's tty termios attributes
 
+    @staticmethod
+    def construct():
+        self = Terminal()
+
+        # see if we're connected to a tty
+        fd = next((fd for fd in [STDIN, STDOUT, STDERR] if os.isatty(fd)), None)
+        if fd == 0:
+            self.input = 0
+
+        if fd is not None:
+            self.tty = fd
+
+            # open and set up a pty
+            self.master, slave = os.openpty()
+
+            # copy tty properties & window size
+            self.termios = termios.tcgetattr(self.tty)
+            termios.tcsetattr(self.master, termios.TCSAFLUSH, self.termios)
+            _setwinsize(self.master, _getwinsize(self.tty))
+
+            # set up the SIGWINCH handler which copies terminal window changes
+            # to the pty
+            def _sigwinch_handler(signum, frame):
+                _setwinsize(self.master, _getwinsize(self.tty))
+            signal.signal(signal.SIGWINCH, _sigwinch_handler)
+
+        return self, slave
+
+    def __del__(self):
+        if self.master is not None:
+            os.close(self.master)
+
+    def __bool__(self):
+        return self.master is not None
+
+    def setraw(self):
+        if self.input is not None:
+            tty.setraw(self.input)
+
+    def reset(self):
+        if self.input is not None:
+            termios.tcsetattr(self.input, tty.TCSAFLUSH, self.termios)
+
+class RunSpec:
     # specification of a worker run. Things like argv, cwd, environ, and file
     # descriptors.
     def __init__(self):
         pass
 
     @staticmethod
-    def construct():
+    def construct(master, slave):
         # constructs the run specification from the current process. This is
         # usually how this class is meant to be constructed, from the client.
-        self = Pipe()
+        self = RunSpec()
 
         # the process environment
         self.argv = sys.argv
         self.cwd = os.getcwd()
+        self.client_pid = os.getpid()
         self.environ = os.environ.copy()
-        self.pid = os.getpid()
 
-        # STDIN/OUT/ERR file descriptiors
-        self.fds = []
-        for fd in [STDIN, STDOUT, STDERR]:
-            if not os.isatty(fd):
-                # pipe -- we can duplicate this directly, for zero overhead
-                # reads/writes
-                self.fds.append(fd)
-            else:
-                # tty -- as the remote process is not part of this session,
-                # it won't be able to directly write to our tty fd. Instead,
-                # we'll open a pty, pass on a slave end, and the client will
-                # manually shuttle data tty <-> pty.
-                if self.pty is None:
-                    # set up a pty made to look like our tty
-                    self.pty = os.openpty()
-                    # copy tty properties & window size
-                    self.tty = os.open(os.ttyname(fd), os.O_RDWR)
-                    self.termios = termios.tcgetattr(self.tty)
-                    termios.tcsetattr(self.pty[1], termios.TCSAFLUSH, self.termios)
-                    _setwinsize(self.pty[1], _getwinsize(self.tty))
-                self.fds.append(self.pty[1])
+        # Pass STDIN/OUT/ERR directly if not a tty, or replace them by the pty
+        # slave if they are.
+        self.fds = [ fd if not os.isatty(fd) else slave for fd in [STDIN, STDOUT, STDERR] ]
+        self.master = master
+        self.slave = slave
 
         return self
 
-    # def __del__(self):
-    #     # close the pty
-    #     if getattr(self, "pty", None):
-    #         os.close(self.pty[0])
-    #         os.close(self.pty[1])
-    #         os.close(self.tty)
-
     def write(self, conn, fp):
         _write_object(fp, self)
-
-        # pass on the master_fd as well, if we have a pty
-        fds = self.fds[:]
-        if self.pty:
-            fds.append(self.pty[0])
-
+        fds = self.fds if self.master is None else self.fds + [ self.master, self.slave ]
         socket.send_fds(conn, [ b'm' ], fds)
 
     @staticmethod
     def receive(conn, fp):
         # called by the sentry to set up the worker process & connection
         self = _read_object(fp)
-        _, fds, _, _ = socket.recv_fds(conn, 10, maxfds=4)
+        _, self.fds, _, _ = socket.recv_fds(conn, 10, maxfds=5)
+        if self.master is not None:
+            self.master = self.fds[3]
+            self.slave = self.fds[4]
+            self.fds = self.fds[:3]
+        return self
 
-        # pty/tty variables
-        if len(fds) == 4:      # means we have a pty
-            for fd in fds:     # one of the fds is our tty; pull it out
-                if os.isatty(fd):
-                    self.tty = fd
-                    break
-            self.pty = (fds[3], self.tty)   # fds[3] is the master_fd; we need to keep it 
-                                            # open on the Sentry so we don't
-                                            # get SIGHUP-ed if the Client
-                                            # exits before us, closing
-                                            # master_fd.
-        self.fds = fds[:3]
-
+    def apply(self):
         # apply the run specification to the current process
         sys.argv = self.argv
         os.chdir(self.cwd)
         os.environ.clear()
         os.environ.update(self.environ)
 
-        # File descriptors for STDIN/OUT/ERR
-        if not _keep_stderr:
-            fdnums = [STDIN, STDOUT, STDERR]
-        else:
-            fdnums = [STDIN, STDOUT]
-        for src, dst in zip(self.fds, fdnums):
+        # duplicate self.fds to STDIN/OUT/ERR
+        for src, dst in zip(self.fds, [STDIN, STDOUT, STDERR]):
             os.dup2(src, dst)
+            os.close(src)
 
         return self
 
@@ -614,7 +621,7 @@ class Client:
     def __init__(self, socket_path) -> None:
         self.socket_path = socket_path
 
-    def _communicate_loop(self, master_fd, tty_fd, control_fp, termios_attr, remote_pid):
+    def _communicate_loop(self, master_fd, stdin_fd, control_fp, termios_attr, remote_pid):
         """Copy and control loop
         Copies
                 pty master -> standard output   (master_read)
@@ -625,7 +632,7 @@ class Client:
         control_fd = control_fp.fileno()
         fds = [ control_fd ]
         if master_fd is not None: fds.append(master_fd)
-        if tty_fd is not None: fds.append(tty_fd)
+        if stdin_fd is not None: fds.append(stdin_fd)
         
         # debug(f"{fds=} {master_fd=} {tty_fd=}")
         while fds:
@@ -646,14 +653,14 @@ class Client:
                     # debug("CLIENT: zero read on master_fd")
                     fds.remove(master_fd)
                 else:
-                    os.write(tty_fd, data)
+                    os.write(stdin_fd, data)
 
             # received input
-            if tty_fd in rfds:
-                data = os.read(tty_fd, 1024*1024)
+            if stdin_fd in rfds:
+                data = os.read(stdin_fd, 1024*1024)
                 debug(f"CLIENT: read input {data=}")
                 if not data:
-                    fds.remove(tty_fd)
+                    fds.remove(stdin_fd)
                 else:
                     _writen(master_fd, data)
 
@@ -664,12 +671,12 @@ class Client:
                 event, data = _read_object(control_fp)
                 # debug(f"CLIENT: received {event=}")
                 if event == "stopped":
-                    if tty_fd is not None:
+                    if stdin_fd is not None:
                         # it's possible we've been backrounded by the time we got here,
                         # so ignore SIGTTOU while mode-setting. This can happen if someone sent
                         # us (the client) an explicit SIGTSTP.
                         signal.signal(signal.SIGTTOU, signal.SIG_IGN)
-                        termios.tcsetattr(tty_fd, tty.TCSAFLUSH, termios_attr)	# restore tty
+                        termios.tcsetattr(stdin_fd, tty.TCSAFLUSH, termios_attr)	# restore tty
                         signal.signal(signal.SIGTTOU, signal.SIG_DFL)
                         # debug("CLIENT: Putting us to sleep")
                         # os.kill(os.getpid(), signal.SIGSTOP)			# put ourselves to sleep
@@ -678,12 +685,12 @@ class Client:
                     # this is where we sleep....
                     # ... and continue when we're awoken by SIGCONT (e.g., 'fg' in the shell)
 
-                    if tty_fd is not None:
+                    if stdin_fd is not None:
      	                # debug("CLIENT: Awake again")
-                        tty.setraw(tty_fd)					# turn the STDIN raw again
+                        tty.setraw(stdin_fd)					# turn the STDIN raw again
 
                         # set terminal size (in case it changed while we slept)
-                        s = fcntl.ioctl(tty_fd, termios.TIOCGWINSZ, '\0'*8)
+                        s = fcntl.ioctl(stdin_fd, termios.TIOCGWINSZ, '\0'*8)
                         fcntl.ioctl(master_fd, termios.TIOCSWINSZ, s)
 
                     # FIXME: we should message the sentry to do this (pid race condition!)
@@ -717,8 +724,8 @@ class Client:
                     return data # data is the exitstatus
                 elif event == "signaled":
                     signum = data  # data is the signal that terminated the worker
-                    if tty_fd is not None:
-                        termios.tcsetattr(tty_fd, tty.TCSAFLUSH, termios_attr)	# restore tty back from the raw mode
+                    if stdin_fd is not None:
+                        termios.tcsetattr(stdin_fd, tty.TCSAFLUSH, termios_attr)	# restore tty back from the raw mode
                     # then restore its default handler and commit a copycat suicide
                     signal.signal(signum, signal.SIG_DFL)
                     _run_coverage_py_atexit()
@@ -726,23 +733,18 @@ class Client:
                 else: #pragma: no cover
                     assert 0, "unknown control event {event}"
 
-    def _communicate(self, fp, pipe, remote_pid):
+    def _communicate(self, fp, term, remote_pid):
         # raw mode control
         try:
             # switch our input to raw mode, so everything is passed on to the
             # worker
-            if pipe.tty is not None:
-                tty.setraw(pipe.tty)
-                master_fd = pipe.pty[0]
-            else:
-                master_fd = None
+            term.setraw()
 
             # Now enter the communication forwarding loop
-            return self._communicate_loop(master_fd, pipe.tty, fp, pipe.termios, remote_pid)
+            return self._communicate_loop(term.master, term.input, fp, term.termios, remote_pid)
         finally:
             # restore our console
-            if pipe.tty is not None:
-                termios.tcsetattr(pipe.tty, tty.TCSAFLUSH, pipe.termios)
+            term.reset()
 
     def _setup_signal_passthrough(self, remote_pid):
         def _handle_ISIG(signum, frame):
@@ -767,13 +769,13 @@ class Client:
 
         # try connecting
         try:
-            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            client.connect(self.socket_path)
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.connect(self.socket_path)
         except (FileNotFoundError, ConnectionRefusedError):
             # connection failed; return None
             return None
 
-        fp = client.makefile(mode='rwb', buffering=0)
+        fp = server.makefile(mode='rwb', buffering=0)
 
         cmd = os.environ.get("INSTA_CMD", None)
         if cmd is not None:
@@ -783,25 +785,20 @@ class Client:
         # this is a command run
         _write_object(fp, "run")
 
-        # set up a run spec and request to launch the worker
-        pipe = Pipe.construct()
-        if pipe.pty:
-            # set up the SIGWINCH handler which copies terminal window changes
-            # to the pty
-            def _sigwinch_handler(signum, frame):
-                _setwinsize(pipe.pty[1], _getwinsize(pipe.tty))
+        # the pty and runspec
+        term, slave = Terminal.construct()
+        rs = RunSpec.construct(term.master, slave)
+        rs.write(server, fp)
+        os.close(slave)
 
-            signal.signal(signal.SIGWINCH, _sigwinch_handler)
-        pipe.write(client, fp)
-
-        # get the child PID
+        # get the worker PID
         remote_pid = _read_object(fp)
 
         # pass any signals we receive back to the worker
         self._setup_signal_passthrough(remote_pid)
 
         # communicate through the pipe until the worker or client end
-        return self._communicate(fp, pipe, remote_pid)
+        return self._communicate(fp, term, remote_pid)
 
 #############################################################################
 #
