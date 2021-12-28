@@ -17,15 +17,6 @@ STDERR = 2
 _worker = None
 _server = None
 
-def _debug_write_pid(name):
-    # debugging/profiling aid: write out our PID into a file in
-    # $INSTA_PID_DIR directory
-    import instastart
-    instastart._name = name
-    if "INSTA_PID_DIR" in os.environ:
-        with open(os.path.join(os.environ["INSTA_PID_DIR"], f"{name}.pid"), "w") as fp:
-            print(os.getpid(), file=fp)
-
 def _construct_socket_name():
     # construct a UNIX socket path reasonably unique to this program
     # invocation. This is where the server will listen for client
@@ -55,25 +46,43 @@ def _setproctitle(title):
     except ImportError: #pragma: no cover
         pass
 
-class TimestampedOutput:
+# The name of this process, for logging ("tty", "worker", "server", "sentry",
+# "client"). Set by _fork(name).
+_name = "client"
+
+def _write_pid(name):
+    if "INSTA_PID_DIR" not in os.environ:
+        return
+
+    with open(os.path.join(os.environ["INSTA_PID_DIR"], f"{name}.pid"), "w") as fp:
+        print(os.getpid(), file=fp)
+
+def _fork(name):
+    pid = os.fork()
+
+    if pid == 0:
+        # fork, reset the child's name (for logging), and write out the child's
+        # PID into a file in $INSTA_PID_DIR directory
+        global _name
+        _name = name
+
+        debug(f"forked {name}")
+        _write_pid(name)
+
+    return pid
+
+class TimestampedOutputFile:
     out = None
-    name = ""
 
-    def __init__(self, out, name):
+    def __init__(self, out):
         self.out = out
-        self.name = name
         self._at_line_start = True
-
-    def set_name(self, name):
-        self.name = name
 
     def write(self, text):
         import datetime
         # add timestamps to beginnings of lines
-#        ts = f'{datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S.%f %Z")} '
         ts = f'{datetime.datetime.now().strftime("%b %d %H:%M:%S.%f")} '
-        if self.name:
-            ts = ts + f'{self.name}[{os.getpid()}] '
+        ts = ts + f'{_name}[{os.getpid()}] '
 
         if self._at_line_start:
             text = ts + text
@@ -88,10 +97,19 @@ class TimestampedOutput:
     def __getattr__(self, name):
         return getattr(self. out, name)
 
+def _setup_logging():
+    # log file must be inheritable across forks
+    fp = open(os.environ.get("INSTA_LOG", os.devnull), "a")
+    os.set_inheritable(fp.fileno(), True)
+
+    global _logfile
+    _logfile = TimestampedOutputFile(fp)
+
 def debug(*argv, **kwargs):
     # our own fast-ish logging routines (importing logging seems to add
     # ~15msec to runtime, tested on macOS/MBA)
-    kwargs['file'] = sys.stderr
+    kwargs['file'] = _logfile
+    kwargs['flush'] = True
     return print(*argv, **kwargs)
 
 #############################################################################
@@ -139,13 +157,29 @@ def _readn(fd, n):
 #   Server
 #############################################################################
 
+def _redirect_stdin_stdout():
+    # redirect all server output to the log file.
+    os.dup2(_logfile.out.fileno(), 1)
+    os.dup2(_logfile.out.fileno(), 2)
+
+    # customize stdout/stderr to prepend timestamps
+    sys.stdout = TimestampedOutputFile(sys.stdout)
+    sys.stderr = TimestampedOutputFile(sys.stderr)
+
+    # We don't close stdin, but redirect it to /dev/null. If we
+    # closed it, a subsequent os.open() or os.pipe() may allocate
+    # fd=0 to some random file/pipe, thus wreaking havoc. (learned
+    # the hard way!)
+    fd = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(fd, 0)
+    os.close(fd)
+
 class Server:
     _readypipe = None   # the pipe that .start() uses to signal the server is ready
     socket_path = None  # path to the UNIX socket we listen on
 
-    def __init__(self, socket_path, log_path) -> None:
+    def __init__(self, socket_path) -> None:
         self.socket_path = socket_path
-        self.log_path = log_path
 
     def fork_and_wait_for_server(self):
         # For this process and wait until the server is ready to accept
@@ -154,7 +188,7 @@ class Server:
         # as a client.
 
         _r, _w = os.pipe()  # this is how the server will tell us it's ready
-        pid = os.fork()
+        pid = _fork("server")
         if pid == 0:
             # daemonize
             os.setsid()
@@ -162,29 +196,11 @@ class Server:
 #            if pid != 0:
 #                os._exit(0)
 
-            # child (== server)
-            _debug_write_pid("server")
-
             os.close(_r)
             name = sys.argv[0].split('/')[-1]
             _setproctitle(f"[instastart: {name}]")
 
-            # redirect the server output to a log file (/dev/null, by
-            # default). Note that the sentry will inherit these.
-            fd = os.open(self.log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
-            os.dup2(fd, 1)
-            os.dup2(fd, 2)
-            os.close(fd)
-            # We don't close stdin, but redirect it to /dev/null. If we
-            # closed it, a subsequent os.open() or os.pipe() may allocate
-            # fd=0 to some random file/pipe, thus wreaking havoc. (learned
-            # the hard way!)
-            fd = os.open(os.devnull, os.O_RDONLY)
-            os.dup2(fd, 0)
-            os.close(fd)
-            # customize stdout/stderr to prepend timestamps
-            sys.stdout = TimestampedOutput(sys.stdout, "server")
-            sys.stderr = TimestampedOutput(sys.stderr, "server")
+            _redirect_stdin_stdout()
 
             # now fall through until we hit start() somewhere in __main__
             self._readypipe = _w
@@ -271,12 +287,8 @@ class Server:
                         sys.exit(0)
                     elif cmd == "run":
                         # Fork a child process to do the work.
-                        child_pid = os.fork()
-                        if child_pid == 0:
-                            _debug_write_pid("sentry")
-                            sys.stdout.set_name("sentry")
-                            sys.stderr.set_name("sentry")
-                            # Child process -- this is where the work gets done
+                        sentry_pid = _fork("sentry")
+                        if sentry_pid == 0:
                             sock.close()
                             return Worker(conn, fp)
                         else:
@@ -371,11 +383,8 @@ class Worker:
             fcntl.ioctl(rs.slave, termios.TIOCSCTTY)
 
         # fork the worker process
-        pid = os.fork()
+        pid = _fork("worker")
         if pid == 0:
-            _debug_write_pid("worker")
-            sys.stdout.set_name("worker")
-            sys.stderr.set_name("worker")
             self._is_worker = True
 
             conn.close()
@@ -484,7 +493,7 @@ class Worker:
                     # the worker process has called done(). Message the
                     # client but remain looping here until the worker
                     # actually terminates.
-                    debug(f"SENTRY: DONE reading {cmd=} {exitstatus=}")
+                    debug(f"wrk_r: {cmd=} {exitstatus=}")
                     assert cmd == "exited"
 
                     _write_object(client_fp, ("exited", exitstatus))
@@ -498,6 +507,7 @@ class Worker:
 
                 # wait for child status
                 _, status = os.waitpid(pid, os.WUNTRACED | os.WCONTINUED)
+                debug(f"sig_r: {status=}")
                 if done:
                     break
 
@@ -569,11 +579,11 @@ class Terminal:
     def run(self):
         client_pid = os.getpid()
 
-        self.pid = os.fork()
+        self.pid = _fork("tty")
         if self.pid == 0:
             # pty proxy process
             try:
-                _setproctitle(f"[{' '.join(sys.argv)} :: pty/{client_pid}]")
+                _setproctitle(f"[{' '.join(sys.argv)} :: tty/{client_pid}]")
                 self._tty_proxy_loop()
             finally:
                 # ensure we never hit end-user code
@@ -711,13 +721,12 @@ def _run_coverage_py_atexit(): #pragma: no cover
             self.captured.append(other)
             return False
 
+    _logexit()
+
     # fantastic hack from https://stackoverflow.com/a/63029332
     c = Capture()
     import atexit
     atexit.unregister(c)
-    for fun in c.captured:
-        print(fun)
-        print(fun.__module__)
 
     for fun in c.captured:
         if fun.__module__.startswith("coverage"):
@@ -869,7 +878,7 @@ def serve(autodone=True):
         done()
 
 def _connect_or_serve():
-    _debug_write_pid("client")
+    _write_pid("client")
 
     # try connecting on our socket; if fail, spawn a new server
     socket_path = _construct_socket_name()
@@ -882,7 +891,7 @@ def _connect_or_serve():
 
     # fork the server. This will return pid or 0, depending on if it's
     # child or parent
-    server = Server(socket_path, os.environ.get("INSTA_LOG", os.devnull))
+    server = Server(socket_path)
     if server.fork_and_wait_for_server():
         # parent (== client)
 
@@ -909,4 +918,11 @@ else:
     raise Exception(f'$INSTA_DISABLE environmental variable must be either "yes" or "no" (current: INSTA_DISABLE={_disabled})')
 
 if not _disabled:
+    _setup_logging()
+    import atexit
+    def _logexit():
+        _logfile.write("exited\n")
+        _logfile.flush()
+    atexit.register(_logexit)
+    debug(f"started: {sys.argv}")
     _server = _connect_or_serve()
