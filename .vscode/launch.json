@@ -29,6 +29,9 @@
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
             "subProcess": true,
+            "env": {
+                "INSTA_LOG": "insta.log"
+            }
             //            "args": [ ">", "foo.log", "2>&1", "<", "/dev/null" ]
         }
     ]

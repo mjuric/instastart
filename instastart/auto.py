@@ -158,9 +158,9 @@ class Server:
         if pid == 0:
             # daemonize
             os.setsid()
-            pid = os.fork()
-            if pid != 0:
-                os._exit(0)
+#            pid = os.fork()
+#            if pid != 0:
+#                os._exit(0)
 
             # child (== server)
             _debug_write_pid("server")
@@ -526,67 +526,124 @@ class Worker:
 #############################################################################
 
 class Terminal:
-    master = None       # pty master
     tty = None          # the client's controlling tty
-    termios = None      # the client's tty termios attributes
+    master = None       # pty master
+    termios = None      # the client's tty original termios attributes
+
+    def __init__(self, tty, master, termios_attr):
+        # don't construct directly; use Terminal.construct()
+        self.tty = tty
+        self.master = master
+        self.termios = termios_attr
+
+        # set up the SIGWINCH handler which copies terminal window changes
+        # to the pty
+        def _sigwinch_handler(signum, frame):
+            self.syncwinsize()
+        signal.signal(signal.SIGWINCH, _sigwinch_handler)
+
+        # copy tty properties & window size
+        termios.tcsetattr(self.master, termios.TCSAFLUSH, self.termios)
+        self.syncwinsize()
+        self.setraw()
 
     @staticmethod
     def construct():
-        self = Terminal()
-        slave = None
-
-        # see if the client is connected to a tty
+        # returns (term: Terminal, slave) tuple or
+        # None, None if there's no controlling tty
         try:
-            self.tty = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+            tty = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
         except OSError as e:
             import errno
             if e.errno != errno.ENXIO:
                 raise
 
-        if self.tty is not None:
-            # open and set up a pty
-            self.master, slave = os.openpty()
+            return None, None
 
-            # copy tty properties & window size
-            self.termios = termios.tcgetattr(self.tty)
-            termios.tcsetattr(self.master, termios.TCSAFLUSH, self.termios)
-            _setwinsize(self.master, _getwinsize(self.tty))
+        # open and set up a pty
+        master, slave = os.openpty()
+        attr = termios.tcgetattr(tty)
 
-            # set up the SIGWINCH handler which copies terminal window changes
-            # to the pty
-            def _sigwinch_handler(signum, frame):
-                _setwinsize(self.master, _getwinsize(self.tty))
-            signal.signal(signal.SIGWINCH, _sigwinch_handler)
+        return Terminal(tty, master, attr), slave
 
-        return self, slave
+    def run(self):
+        client_pid = os.getpid()
+
+        self.pid = os.fork()
+        if self.pid == 0:
+            # pty proxy process
+            try:
+                _setproctitle(f"[{' '.join(sys.argv)} :: pty/{client_pid}]")
+                self._tty_proxy_loop()
+            finally:
+                # ensure we never hit end-user code
+                _run_coverage_py_atexit()
+                os._exit(0)  #pragma: no cover
+
+    def _tty_proxy_loop(self):
+        fds = [ self.master, self.tty ]
+        while fds:
+            rfds, _wfds, _xfds = select.select(fds, [], [])
+
+            if self.master in rfds:
+                try:
+                    data = os.read(self.master, 1024*1024)
+                except OSError:
+                    data = b""
+
+                if not data:
+                    # No one listening on the slave end of the pty any more.
+                    # We can exit, as there'll be nothing more to forward.
+                    # Note: on Linux, once the last slave fd is closed, the
+                    # trying to reopen it with open(/dev/tty) doesn't seem to
+                    # work -- the open succeeds, writes succeed, but nothing
+                    # is forwarded back to the master.
+                    break
+
+                _writen(self.tty, data)
+
+            if self.tty in rfds:
+                try:
+                    data = os.read(self.tty, 1024*1024)
+                except OSError:
+                    data = b""
+
+                if not data:
+                    # our tty got closed; we should exit (and will probably
+                    # receive a SIGHUP anyway)
+                    break
+
+                _writen(self.master, data)
 
     def __del__(self):
-        if self.master is not None:
-            os.close(self.master)
+        os.close(self.tty)
+        os.close(self.master)
 
-    def __bool__(self):
-        return self.master is not None
+    def resume(self):
+        os.kill(self.pid, signal.SIGCONT)
+
+    def syncwinsize(self):
+        _setwinsize(self.master, _getwinsize(self.tty))
 
     def setraw(self):
-        if self.tty is not None:
-            # FIXME: there's a difficult-to-avoid race condition here. When
-            # the client is started, it takes a few milliseconds to establish
-            # pty proxying and switch the tty to raw mode. In that time, the
-            # user may send keystrokes to the tty. These will be buffered (or
-            # converted to signals -- such as ^C or ^D). Signals will
-            # mostly terminate or pause the process (which would happen with
-            # the original code), but ordinary will remain in the line buffer
-            # _and_ be echoed to the client tty. There's not much we can do
-            # here, but discard them (ergo termios.TCSAFLUSH). I've
-            # investigated using termios.TCSANOW instead, but once tty
-            # echoing happens it's impossible to reverse cleanly. This should
-            # not be an issue in real life, but mostly with automated tools
-            # such as pexpect.
-            tty.setraw(self.tty, termios.TCSAFLUSH)
+        # FIXME: there's a difficult-to-avoid race condition here. When
+        # the client is started, it takes a few milliseconds to establish
+        # pty proxying and switch the tty to raw mode. In that time, the
+        # user may send keystrokes to the tty. These will be buffered (or
+        # converted to signals -- such as ^C or ^D). Signals will
+        # mostly terminate or pause the process (which would happen with
+        # the original code), but ordinary will remain in the line buffer
+        # _and_ be echoed to the client tty. There's not much we can do
+        # here, but discard them (ergo termios.TCSAFLUSH). I've
+        # investigated using termios.TCSANOW instead, but once tty
+        # echoing happens it's impossible to reverse cleanly. This should
+        # not be an issue in real life, but mostly with automated tools
+        # such as pexpect.
+        tty.setraw(self.tty, termios.TCSAFLUSH)
 
     def reset(self):
-        if self.tty is not None:
-            termios.tcsetattr(self.tty, tty.TCSAFLUSH, self.termios)
+        attr = termios.tcgetattr(self.master)
+        termios.tcsetattr(self.tty, tty.TCSAFLUSH, attr)
 
 class RunSpec:
     # specification of a worker run. Things like argv, cwd, environ, and file
@@ -680,138 +737,42 @@ class Client:
     def __init__(self, socket_path) -> None:
         self.socket_path = socket_path
 
-    def _communicate_loop(self, master_fd, tty_fd, control_fp, termios_attr, remote_pid):
-        """Copy and control loop
-        Copies
-                pty master -> standard output   (master_read)
-                standard input -> pty master    (stdin_read)
-        and also listens for control messages from the child
-        on control_fd/fp.
-        """
-        control_fd = control_fp.fileno()
-        fds = [ control_fd ]
-        if master_fd is not None: fds.append(master_fd)
-        if tty_fd is not None: fds.append(tty_fd)
-        
-#        debug(f"{fds=} {master_fd=} {tty_fd=}")
-#        os.write(tty_fd, f"{fds=} {master_fd=} {tty_fd=}".encode('utf-8'))
-#        os.write(tty_fd, str(termios.tcgetattr(master_fd)).encode("utf-8"))
-        while fds:
-            rfds, _wfds, _xfds = select.select(fds, [], [])
-            # import time; debug(f"{rfds=} {time.time()=}")
-            #  os.write(tty_fd, f"{rfds=} ".encode('utf-8'))
+    def _client_proxy(self, term, control_fp, remote_pid):
+        while True:
+            # a control message from the worker. they've paused, exited, etc.
+            # if we receive something here, means the worker has returned
+            # control to the shell (the sentry).
+            event, data = _read_object(control_fp)
 
-            # received output
-            if master_fd in rfds:
-                # Some OSes signal EOF by returning an empty byte string,
-                # some (incl. Linux) throw OSErrors. EOF can happen if
-                # the client closes all pty file descriptors.
-                try:
-                    data = os.read(master_fd, 1024*1024)
-                except OSError:
-                    data = b""
-                #debug(f"CLIENT: read output {data=}")
-                if not data:  # Reached EOF.
-                    # debug("CLIENT: zero read on master_fd")
-                    fds.remove(master_fd)
-                else:
-                    os.write(tty_fd, data)
+            if term:
+                # FIXME: what happens here if we're in the 
+                # background when the client exits?
+                term.reset()
 
-            # received input
-            if tty_fd in rfds:
-                data = os.read(tty_fd, 1024*1024)
-                # debug(f"CLIENT: read input {data=}")
-                if not data:
-                    fds.remove(tty_fd)
-                else:
-                    #os.write(tty_fd, data)
-                    _writen(master_fd, data)
+            if event == "exited":
+                exitstatus = data
+                return exitstatus
+            elif event == "stopped":
+                os.kill(0, signal.SIGSTOP)
 
-            # received a control message
-            if control_fd in rfds:
-                # a control message from the worker. they've
-                # paused, exited, etc.
-                event, data = _read_object(control_fp)
-                # debug(f"CLIENT: received {event=}")
-                if event == "stopped":
-                    if tty_fd is not None:
-                        # it's possible we've been backrounded by the time we got here,
-                        # so ignore SIGTTOU while mode-setting. This can happen if someone sent
-                        # us (the client) an explicit SIGTSTP.
-                        signal.signal(signal.SIGTTOU, signal.SIG_IGN)
-                        termios.tcsetattr(tty_fd, tty.TCSAFLUSH, termios_attr)	# restore tty
-                        signal.signal(signal.SIGTTOU, signal.SIG_DFL)
-                        # debug("CLIENT: Putting us to sleep")
-                        # os.kill(os.getpid(), signal.SIGSTOP)			# put ourselves to sleep
-                    os.kill(0, signal.SIGSTOP)			# put ourselves to sleep
+                # this is where we sleep....
+                # ... and continue when we're awoken by SIGCONT (e.g., 'fg' in the shell)
 
-                    # this is where we sleep....
-                    # ... and continue when we're awoken by SIGCONT (e.g., 'fg' in the shell)
+                if term:
+                    term.setraw()
+                    term.syncwinsize()
+                    term.resume()
 
-                    if tty_fd is not None:
-     	                # debug("CLIENT: Awake again")
-                        tty.setraw(tty_fd)					# turn the STDIN raw again
-
-                        # set terminal size (in case it changed while we slept)
-                        s = fcntl.ioctl(tty_fd, termios.TIOCGWINSZ, '\0'*8)
-                        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, s)
-
-                    # FIXME: we should message the sentry to do this (pid race condition!)
-                    os.killpg(os.getpgid(remote_pid), signal.SIGCONT)	# wake up the worker process
-                elif event == "exited":
-                    # FIXME: there are two subtle problems here, which are
-                    # (hopefully) academic in real-world scenarios.
-                    # 1) if the worker writes out more data its stdout/err
-                    #    than we can read in a single os.read(), and then
-                    #    exits with done(), we may exit here before we've
-                    #    copied everything over from master_fd. We defend
-                    #    agains this by using a sizable buffer (~1M) on
-                    #    os.read (see above), which is hopefully larger than
-                    #    any kernel-level buffer. We can't just wait and
-                    #    continue to read until stdout/err are closed, as
-                    #    these may be kept open by any children the worker
-                    #    has spawned (e.g., imagine a poorly written daemon
-                    #    that doesn't close the std* streams).
-                    # 2) if the worker's code spawns a child, which inherits
-                    #    the stdout/err file descriptors, then exits w. the
-                    #    child running & writing to stdout/err, those writes
-                    #    will stop being copied over to the client's tty.
-                    #    This sort of thing is usually a bug w. the user's
-                    #    code, but the difference in running w. vs. w/o
-                    #    instastart is displeasing.
-                    #
-                    # A possible fix may be to fork a background process at
-                    # here before exiting, which would continue this loop
-                    # until both master_fd and/or tty_fd are closed.
-
-                    return data # data is the exitstatus
-                elif event == "signaled":
-                    signum = data  # data is the signal that terminated the worker
-                    if tty_fd is not None:
-                        termios.tcsetattr(tty_fd, tty.TCSAFLUSH, termios_attr)	# restore tty back from the raw mode
-                    # then restore its default handler and commit a copycat suicide
-                    signal.signal(signum, signal.SIG_DFL)
-                    _run_coverage_py_atexit()
-                    os.kill(os.getpid(), signum) #pragma: no cover
-                else: #pragma: no cover
-                    assert 0, "unknown control event {event}"
-
-    def _communicate(self, fp, term, remote_pid):
-        # raw mode control
-        try:
-            # switch our input to raw mode, so everything is passed on to the
-            # worker
-            term.setraw()
-
-            # Now enter the communication forwarding loop.
-            # Note: why do we listen on term.tty even if the process has
-            # STDIN redirected to a pipe/file? Because the process can still
-            # regain access to the tty by opening /dev/tty. We therefore must
-            # forward all tty input to the pty, to cover for that eventuallity.
-            return self._communicate_loop(term.master, term.tty, fp, term.termios, remote_pid)
-        finally:
-            # restore our console
-            term.reset()
+                # wake up the worker
+                os.killpg(os.getpgid(remote_pid), signal.SIGCONT)
+            elif event == "signaled":
+                # commit copycat suicide
+                signum = data
+                signal.signal(signum, signal.SIG_DFL)
+                _run_coverage_py_atexit()
+                os.kill(os.getpid(), signum) #pragma: no cover
+            else: #pragma: no cover
+                assert 0, "unknown control event {event}"
 
     def _setup_signal_passthrough(self, remote_pid):
         def _handle_ISIG(signum, frame):
@@ -856,17 +817,18 @@ class Client:
         term, slave = Terminal.construct()
         rs = RunSpec.construct(term.master, slave)
         rs.write(server, fp)
-        if slave is not None:
+        if term:
             os.close(slave)
+            term.run()
 
         # get the worker PID
-        remote_pid = _read_object(fp)
+        worker_pid = _read_object(fp)
 
         # pass any signals we receive back to the worker
-        self._setup_signal_passthrough(remote_pid)
+        self._setup_signal_passthrough(worker_pid)
 
         # communicate through the pipe until the worker or client end
-        return self._communicate(fp, term, remote_pid)
+        return self._client_proxy(term, fp, worker_pid)
 
 #############################################################################
 #
