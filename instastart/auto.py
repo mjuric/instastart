@@ -156,17 +156,18 @@ class Server:
         _r, _w = os.pipe()  # this is how the server will tell us it's ready
         pid = os.fork()
         if pid == 0:
+            # daemonize
+            os.setsid()
+            pid = os.fork()
+            if pid != 0:
+                os._exit(0)
+
             # child (== server)
             _debug_write_pid("server")
 
             os.close(_r)
             name = sys.argv[0].split('/')[-1]
             _setproctitle(f"[instastart: {name}]")
-
-            # start a new session, to protect the child from SIGHUPs, etc. we
-            # don't double-fork as the daemon never really does anything
-            # funny with the tty.
-            os.setsid()
 
             # redirect the server output to a log file (/dev/null, by
             # default). Note that the sentry will inherit these.
@@ -198,7 +199,7 @@ class Server:
                     break
             os.close(_r)
             # print(f"Signal received!")
-        return pid
+        return pid != 0
 
     def _serve(self, timeout):
         # this is invoked by start(), at a point where user's one-time
@@ -418,7 +419,7 @@ class Worker:
             os.setpgid(pid, pid)        # start a new process group for the child
             if rs.master is not None:
                 os.tcsetpgrp(rs.slave, pid)                # make the child's the foreground process group (so it receives tty input+signals)
-                os.close(rs.slave)
+                #os.close(rs.slave)
 
             _write_object(fp, pid)      # send the child's PID back to the client
 
@@ -526,7 +527,6 @@ class Worker:
 
 class Terminal:
     master = None       # pty master
-#    input = None        # set to 0 if STDIN is connected to a tty
     tty = None          # the client's controlling tty
     termios = None      # the client's tty termios attributes
 
@@ -535,15 +535,15 @@ class Terminal:
         self = Terminal()
         slave = None
 
-        # see if we're connected to a tty
-        fd = next((fd for fd in [STDIN, STDOUT, STDERR] if os.isatty(fd)), None)
-#        if fd == 0:
-#            self.input = 0
+        # see if the client is connected to a tty
+        try:
+            self.tty = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+        except OSError as e:
+            import errno
+            if e.errno != errno.ENXIO:
+                raise
 
-        if fd is not None:
-            # open a fd to our tty, independent of STDIN/OUT/ERR
-            self.tty = os.open(os.ttyname(fd), os.O_RDWR)
-
+        if self.tty is not None:
             # open and set up a pty
             self.master, slave = os.openpty()
 
@@ -569,7 +569,20 @@ class Terminal:
 
     def setraw(self):
         if self.tty is not None:
-            tty.setraw(self.tty)
+            # FIXME: there's a difficult-to-avoid race condition here. When
+            # the client is started, it takes a few milliseconds to establish
+            # pty proxying and switch the tty to raw mode. In that time, the
+            # user may send keystrokes to the tty. These will be buffered (or
+            # converted to signals -- such as ^C or ^D). Signals will
+            # mostly terminate or pause the process (which would happen with
+            # the original code), but ordinary will remain in the line buffer
+            # _and_ be echoed to the client tty. There's not much we can do
+            # here, but discard them (ergo termios.TCSAFLUSH). I've
+            # investigated using termios.TCSANOW instead, but once tty
+            # echoing happens it's impossible to reverse cleanly. This should
+            # not be an issue in real life, but mostly with automated tools
+            # such as pexpect.
+            tty.setraw(self.tty, termios.TCSAFLUSH)
 
     def reset(self):
         if self.tty is not None:
@@ -680,10 +693,13 @@ class Client:
         if master_fd is not None: fds.append(master_fd)
         if tty_fd is not None: fds.append(tty_fd)
         
-        # debug(f"{fds=} {master_fd=} {tty_fd=}")
+#        debug(f"{fds=} {master_fd=} {tty_fd=}")
+#        os.write(tty_fd, f"{fds=} {master_fd=} {tty_fd=}".encode('utf-8'))
+#        os.write(tty_fd, str(termios.tcgetattr(master_fd)).encode("utf-8"))
         while fds:
             rfds, _wfds, _xfds = select.select(fds, [], [])
             # import time; debug(f"{rfds=} {time.time()=}")
+            #  os.write(tty_fd, f"{rfds=} ".encode('utf-8'))
 
             # received output
             if master_fd in rfds:
@@ -694,7 +710,7 @@ class Client:
                     data = os.read(master_fd, 1024*1024)
                 except OSError:
                     data = b""
-#                debug(f"CLIENT: read output {data=}")
+                #debug(f"CLIENT: read output {data=}")
                 if not data:  # Reached EOF.
                     # debug("CLIENT: zero read on master_fd")
                     fds.remove(master_fd)
@@ -704,10 +720,11 @@ class Client:
             # received input
             if tty_fd in rfds:
                 data = os.read(tty_fd, 1024*1024)
-#                debug(f"CLIENT: read input {data=}")
+                # debug(f"CLIENT: read input {data=}")
                 if not data:
                     fds.remove(tty_fd)
                 else:
+                    #os.write(tty_fd, data)
                     _writen(master_fd, data)
 
             # received a control message
@@ -904,7 +921,7 @@ def _connect_or_serve():
     # fork the server. This will return pid or 0, depending on if it's
     # child or parent
     server = Server(socket_path, os.environ.get("INSTA_LOG", os.devnull))
-    if server.fork_and_wait_for_server() != 0:
+    if server.fork_and_wait_for_server():
         # parent (== client)
 
         # try connecting again

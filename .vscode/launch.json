@@ -17,7 +17,7 @@
             "module": "pytest",
             "args": [
                 "--no-cov",
-                "tests/test_simple.py::test_script[simple.py]"
+                "tests/test_simple.py::test_reopen_tty"
             ],
             "cwd": "${workspaceFolder}"
         },

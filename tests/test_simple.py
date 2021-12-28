@@ -246,3 +246,29 @@ def test_ctrl_d(env):
             p.expect_exact("Done, exiting.\r\n")
             p.wait()
 
+def test_reopen_tty(env):
+    msg = "Hello from the tty"
+    with in_scripts_dir():
+        with wait_all(env, must_exist=False) as env:
+            cmd = f"{sys.executable} rawecho.py --instastart < <(echo open stdin /dev/tty) > foo.log 2>&1"
+            p = pexpect.spawn(f'bash -c "{cmd}"', env=env, encoding='utf-8')
+            # Wait for the client to spin up fully before sending commands.
+            # Otherwise they'll be discarded on tty mode change. (see docs of
+            # Terminal.setraw())
+            p.waitnoecho()
+            # check we can send a message (and that it's echoed by the tty)
+            p.sendline(msg)
+            p.expect(f"^{msg}\r\n", timeout=1)
+            # end of output
+            p.sendeof()
+            p.expect_exact(pexpect.EOF, timeout=1)
+            assert p.before == '', "Unexpected output."
+            p.wait()
+
+            # check that we have msg in the output file
+            s = "> " + repr((msg + "\n").encode('utf-8'))
+            with open('foo.log') as fp:
+                for line in fp:
+                    if line == s + "\n": break
+                else:
+                    assert False, f"'{s}' not found in output."
