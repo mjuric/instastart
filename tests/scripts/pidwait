@@ -1,0 +1,66 @@
+#!/bin/bash
+#
+# pidwait <command> [args...]
+#
+# execute a command and then wait until all processes listed in 
+# $INSTA_PID_DIR/*.pid are dead. Timeout after about 10 seconds.
+# 
+
+if [[ $1 == -c ]]; then
+    shift
+    run() {
+        eval "$1"
+    }
+else
+    run() {
+        "$@"
+    }
+fi
+
+# log when we launched
+if [[ ! -z $INSTA_LOG ]]; then
+    now=$(date +"%b %d %H:%M:%S.%N")
+    now=${now:0:22}
+    echo "$now driver[$$] launching $@" >> "$INSTA_LOG"
+fi
+
+run "$@"
+exitstatus=$?
+
+# log when control returned to the shell
+if [[ ! -z $INSTA_LOG ]]; then
+    now=$(date +"%b %d %H:%M:%S.%N")
+    now=${now:0:22}
+    echo "$now driver[$$] returned to shell, exitstatus=$exitstatus." >> "$INSTA_LOG"
+fi
+
+for i in $(seq 200); do
+        alive=0
+#        for pid in $(cat "$INSTA_PID_DIR"/*.pid); do
+        for pid in $(cat "$INSTA_PID_DIR"/{client,tty}.pid); do
+            kill -s 0 "$pid" 2>/dev/null && { alive=1; break; }
+        done
+        if [[ $alive == 0 ]]; then
+            break
+        fi
+        sleep 0.01
+done
+
+# log when we were done
+if [[ ! -z $INSTA_LOG ]]; then
+    now=$(date +"%b %d %H:%M:%S.%N")
+    now=${now:0:22}
+    echo "$now driver[$$] atexit (after ~$((i*10))ms wait)" >> "$INSTA_LOG"
+fi
+
+exit $exitstatus
+
+# now exit in the same way as the command
+# issue: bash ignores SIGQUIT, so we'll just exit with $exitstatus as done above)
+# (see https://www.gnu.org/software/bash/manual/html_node/Signals.html)
+if [[ $exitstatus -gt 128 ]]; then
+    ((signum = exitstatus - 128))
+    kill -s $signum $$
+else
+    exit $exitstatus
+fi

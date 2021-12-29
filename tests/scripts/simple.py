@@ -14,7 +14,9 @@ if __name__ == "__main__":
     with instastart.auto.serve(**kwargs):
         print("Hello world")
 
-    # this shouldn't appear in the output
+    # this shouldn't appear in the output if autodone=True
     print("Exiting", file=sys.stderr)
+
+    # emulate slow shutdown
     import time
     time.sleep(0.5)

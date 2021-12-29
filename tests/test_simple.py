@@ -13,7 +13,7 @@ def in_scripts_dir():
 def env():
     env = os.environ.copy()
     env["PYTHONPATH"] = os.getcwd()
-    env["INSTA_TIMEOUT"] = "0.5"
+    env["INSTA_TIMEOUT"] = "0"
     env["INSTA_LOG"] = os.getcwd() + "/pytest.log"
     return env
 
@@ -84,7 +84,7 @@ def test_with_pty(script, env):
 
     with in_scripts_dir():
         with wait_all(env) as env:
-            child = pexpect.spawn(script, env=env)
+            child = pexpect.spawn(f"./pidwait {script}", env=env)
             child.expect_exact('Hello world\r\n')
             if script.endswith("no"):
                 child.expect_exact('Exiting\r\n')
@@ -120,7 +120,7 @@ def test_progress(env):
 
         # with instastart
         with wait_all(env) as env2:
-            out_on = pty_run([sys.executable, "progress.py"], env2)
+            out_on = pty_run(["./pidwait", sys.executable, "progress.py"], env2)
 
         assert out_on == out_off
 
@@ -130,7 +130,7 @@ def test_stop_server(env):
         with wait_all(env_orig) as env:
             # spin up a simple server with a longish timeout, and exit the client
             env["INSTA_TIMEOUT"] = "100"
-            p = pexpect.spawn(f"{sys.executable} echo.py", env=env)
+            p = pexpect.spawn(f"./pidwait {sys.executable} echo.py", env=env)
             p.expect_exact("> ")
             p.sendeof()
             p.expect_exact("Done, exiting.\r\n")
@@ -175,27 +175,27 @@ def wait_for(procs, states, timeout):
 
         time.sleep(0.02)
 
-    raise TimeoutError() # pragma: no cover
+    raise TimeoutError(str(procs)) # pragma: no cover
 
 def test_suspend_resume(env):
     with in_scripts_dir():
         with wait_all(env) as env:
             # spin up a client + worker
-            p = pexpect.spawn(f"{sys.executable} echo.py", env=env, encoding='utf-8')
+            p = pexpect.spawn(f"./pidwait {sys.executable} echo.py", env=env, encoding='utf-8', timeout=1)
             p.expect_exact("> ")
 
             client, worker = get_pids(env["INSTA_PID_DIR"], "client", "worker")
             pcli, pwrk = psutil.Process(client), psutil.Process(worker)
  
-            # make the client stop
-            os.kill(client, signal.SIGTSTP)
+            # make the client stop via explicit signal
+            p.sendcontrol('z')
 
             # verify that both the client and the worker went to sleep
             wait_for([pcli, pwrk], ['stopped'], timeout=1.)
 
             # resume and verify they both woke up (transitioned to 'sleeping'
             # state)
-            os.kill(client, signal.SIGCONT)
+            os.killpg(os.getpgid(client), signal.SIGCONT)
             wait_for([pcli, pwrk], ['sleeping'], timeout=1.)
 
             # make sure everything still works
@@ -205,6 +205,7 @@ def test_suspend_resume(env):
             # exit the client
             p.sendeof()
             p.expect_exact("Done, exiting.\r\n")
+            p.expect_exact(pexpect.EOF)
             p.wait()
 
 @pytest.mark.parametrize("signum", [signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGQUIT, signal.SIGKILL])
@@ -212,7 +213,7 @@ def test_intr(env, signum):
     with in_scripts_dir():
         with wait_all(env) as env:
             # spin up a client + worker
-            p = pexpect.spawn(f"{sys.executable} echo.py", env=env, encoding='utf-8')
+            p = pexpect.spawn(f"./pidwait {sys.executable} echo.py", env=env, encoding='utf-8')
             p.expect_exact("> ")
 
             client, worker = get_pids(env["INSTA_PID_DIR"], "client", "worker")
@@ -228,13 +229,14 @@ def test_intr(env, signum):
             p.wait()
 
             # verify the correct signal killed the process
-            assert (p.exitstatus, p.signalstatus) == (None, signum)
+            #assert (p.exitstatus, p.signalstatus) == (None, signum)
+            assert (p.exitstatus, p.signalstatus) == (128+signum, None) # see the comment in pidwait
 
 def test_ctrl_d(env):
     with in_scripts_dir():
         with wait_all(env) as env:
             # spin up a client + worker
-            p = pexpect.spawn(f"{sys.executable} echo.py", env=env, encoding='utf-8')
+            p = pexpect.spawn(f"./pidwait {sys.executable} echo.py", env=env, encoding='utf-8')
             p.expect_exact("> ")
 
             client, worker = get_pids(env["INSTA_PID_DIR"], "client", "worker")
@@ -251,7 +253,7 @@ def test_reopen_tty(env):
     with in_scripts_dir():
         with wait_all(env, must_exist=False) as env:
             cmd = f"{sys.executable} rawecho.py --instastart < <(echo open stdin /dev/tty) > foo.log 2>&1"
-            p = pexpect.spawn(f'bash -c "{cmd}"', env=env, encoding='utf-8')
+            p = pexpect.spawn(f'./pidwait -c "{cmd}"', env=env, encoding='utf-8')
             # Wait for the client to spin up fully before sending commands.
             # Otherwise they'll be discarded on tty mode change. (see docs of
             # Terminal.setraw())

@@ -66,8 +66,9 @@ def _fork(name):
         global _name
         _name = name
 
-        debug(f"forked {name}")
         _write_pid(name)
+    else:
+        debug(f"forked {name}[{pid}]")
 
     return pid
 
@@ -81,8 +82,7 @@ class TimestampedOutputFile:
     def write(self, text):
         import datetime
         # add timestamps to beginnings of lines
-        ts = f'{datetime.datetime.now().strftime("%b %d %H:%M:%S.%f")} '
-        ts = ts + f'{_name}[{os.getpid()}] '
+        ts = f'{datetime.datetime.now().strftime("%b %d %H:%M:%S.%f")} {_name:>6s}[{os.getpid()}] '
 
         if self._at_line_start:
             text = ts + text
@@ -218,10 +218,16 @@ class Server:
         return pid != 0
 
     def _serve(self, timeout):
+        # timeout: None == wait forever. 0 == one shot. >= 0, timeout in seconds
+        #
         # this is invoked by start(), at a point where user's one-time
         # (heavy) initialization has completed. We'll pause execution,
         # daemonize, and start waiting for incoming connections to fork off
         # children (workers) to continue doing the work.
+
+        one_shot = timeout == 0
+        if one_shot:
+            timeout = None
 
         # safely set up a socket on which to listen for connections.
         # avoid the race condition where two clients are launched
@@ -232,7 +238,7 @@ class Server:
             os.unlink(spath)
 
         # debug(f"Opening socket at {socket_path=} with {timeout=}...", end='')
-        child_pid = 0
+        sentry_pid = None
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                 sock.settimeout(timeout)
@@ -272,18 +278,18 @@ class Server:
                     try:
                         conn, _ = sock.accept()
                     except socket.timeout:
-                        debug("Server timeout. Exiting")
+                        debug(f"{timeout} seconds since last connection. exiting")
                         sys.exit(0)
-                    debug(f"Connection accepted")
+                    debug(f"connection accepted")
 
                     # make our life easier & create a file-like object
                     fp = conn.makefile(mode='rwb', buffering=0)
 
                     cmd = _read_object(fp)
-                    debug(f"{cmd=}")
+                    debug(f"received command '{cmd}'")
                     if cmd == "stop":
                         # exit the listen loop
-                        debug("Server received a command to exit. Exiting")
+                        debug("explicitly asked to stop. exiting.")
                         sys.exit(0)
                     elif cmd == "run":
                         # Fork a child process to do the work.
@@ -293,8 +299,12 @@ class Server:
                             return Worker(conn, fp)
                         else:
                             conn.close()
+
+                    if one_shot:
+                        debug(f"limit of one accepted connection reached. exiting")
+                        sys.exit(0)
         finally:
-            if child_pid != 0:
+            if sentry_pid != 0:
                 # server process exiting. clean up the socket file(s).
                 if os.path.exists(spath):
                     os.unlink(spath)
@@ -379,7 +389,7 @@ class Worker:
         rs = RunSpec.receive(conn, fp)
 
         # make the pty our controlling terminal, if there is one
-        if rs.master is not None:
+        if rs.slave is not None:
             fcntl.ioctl(rs.slave, termios.TIOCSCTTY)
 
         # fork the worker process
@@ -390,8 +400,7 @@ class Worker:
             conn.close()
             os.close(w)
             os.close(wrk_r)
-            if rs.master is not None:
-                os.close(rs.master)
+            if rs.slave is not None:
                 os.close(rs.slave)
             self.wrk_w = wrk_w      # so done() can use it to message the sentry
 
@@ -407,6 +416,7 @@ class Worker:
             os.close(r)
 
             # return to __main__ to run the payload
+            debug("starting user code execution")
             return
         else:
             os.close(rs.fds[0])
@@ -426,9 +436,8 @@ class Worker:
             signal.signal(signal.SIGCHLD, lambda signum, frame: None)  # have to set a dummy handler, otherwise sig_w isn't woken up
 
             os.setpgid(pid, pid)        # start a new process group for the child
-            if rs.master is not None:
+            if rs.slave is not None:
                 os.tcsetpgrp(rs.slave, pid)                # make the child's the foreground process group (so it receives tty input+signals)
-                #os.close(rs.slave)
 
             _write_object(fp, pid)      # send the child's PID back to the client
 
@@ -476,6 +485,7 @@ class Worker:
                 fds.remove(client_fd)
 
                 if not done:
+                    debug(f"detected that the client has died. killing worker.")
                     os.killpg(os.getpgid(pid), signal.SIGKILL)
 
             if wrk_r in rfds:
@@ -488,12 +498,13 @@ class Worker:
 
                 if cmd == "closed":
                     # the worker process has exited & closed the pipe
+                    debug(f"pipe to worker[{pid}] closed ({done=})")
                     fds.remove(wrk_r)
                 elif cmd == "exited":
                     # the worker process has called done(). Message the
                     # client but remain looping here until the worker
                     # actually terminates.
-                    debug(f"wrk_r: {cmd=} {exitstatus=}")
+                    debug(f"worker[{pid}] invoked instastart.auto.done({exitstatus}) ({done=})")
                     assert cmd == "exited"
 
                     _write_object(client_fp, ("exited", exitstatus))
@@ -507,24 +518,28 @@ class Worker:
 
                 # wait for child status
                 _, status = os.waitpid(pid, os.WUNTRACED | os.WCONTINUED)
-                debug(f"sig_r: {status=}")
+                debug(f"waitpid({pid}) returned {status=} ({done=})")
                 if done:
                     break
 
                 if os.WIFSTOPPED(status):
                     # let the controller know we've stopped
+                    debug(f"worker stopped")
                     _write_object(client_fp, ("stopped", 0))
                 elif os.WIFEXITED(status):
                     # we've exited. return the status back to the controller
+                    debug(f"worker exited, exitstatus={os.WEXITSTATUS(status)}")
                     _write_object(client_fp, ("exited", os.WEXITSTATUS(status)))
                     break
                 elif os.WIFSIGNALED(status):
                     # we've exited. return the status back to the controller
+                    debug(f"worker terminated with signal {os.WTERMSIG(status)}")
                     _write_object(client_fp, ("signaled", os.WTERMSIG(status)))
                     break
                 elif os.WIFCONTINUED(status):
                     # we've been continued after being stopped
                     # TODO: should we make sure the remote_pid is signaled to CONT?
+                    debug(f"worker continued (SIGCONT)")
                     pass
                 else:
                     assert False, f"weird {status=}" #pragma: no cover
@@ -576,11 +591,27 @@ class Terminal:
 
         return Terminal(tty, master, attr), slave
 
-    def run(self):
+    def run(self, close_fds=[]):
         client_pid = os.getpid()
 
         self.pid = _fork("tty")
         if self.pid == 0:
+            for fd in close_fds:
+                os.close(fd)
+
+            # def _on_signal(signum, frame):
+            #     # convert to name
+            #     sig = next((sig.name for sig in signal.Signals if sig == signum), f"signal {signum}")
+            #     debug(f"caught {sig}.")
+            #     if sig in [signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGQUIT]:
+            #         signal.signal(signum, signal.SIG_DFL)
+            #         os.kill(os.getpid(), signum)
+
+            # catchable_sigs = set(signal.Signals) - {signal.SIGKILL, signal.SIGSTOP}
+            # catchable_sigs = {signal.SIGHUP}
+            # for sig in catchable_sigs:
+            #     signal.signal(sig, _on_signal)  # Substitute handler of choice for `print`
+
             # pty proxy process
             try:
                 _setproctitle(f"[{' '.join(sys.argv)} :: tty/{client_pid}]")
@@ -604,10 +635,11 @@ class Terminal:
                 if not data:
                     # No one listening on the slave end of the pty any more.
                     # We can exit, as there'll be nothing more to forward.
-                    # Note: on Linux, once the last slave fd is closed, the
+                    # Note: on Linux, once the last slave fd is closed,
                     # trying to reopen it with open(/dev/tty) doesn't seem to
                     # work -- the open succeeds, writes succeed, but nothing
                     # is forwarded back to the master.
+                    debug("pty slave closed. exiting.")
                     break
 
                 _writen(self.tty, data)
@@ -621,6 +653,7 @@ class Terminal:
                 if not data:
                     # our tty got closed; we should exit (and will probably
                     # receive a SIGHUP anyway)
+                    debug("tty (stdin) closed. exiting.")
                     break
 
                 _writen(self.master, data)
@@ -662,7 +695,7 @@ class RunSpec:
         pass
 
     @staticmethod
-    def construct(master, slave):
+    def construct(slave):
         # constructs the run specification from the current process. This is
         # usually how this class is meant to be constructed, from the client.
         self = RunSpec()
@@ -676,14 +709,13 @@ class RunSpec:
         # Pass STDIN/OUT/ERR directly if not a tty, or replace them by the pty
         # slave if they are.
         self.fds = [ fd if not os.isatty(fd) else slave for fd in [STDIN, STDOUT, STDERR] ]
-        self.master = master
         self.slave = slave
 
         return self
 
     def write(self, conn, fp):
         _write_object(fp, self)
-        fds = self.fds if self.master is None else self.fds + [ self.master, self.slave ]
+        fds = self.fds if self.slave is None else self.fds + [ self.slave ]
         socket.send_fds(conn, [ b'm' ], fds)
 
     @staticmethod
@@ -691,9 +723,8 @@ class RunSpec:
         # called by the sentry to set up the worker process & connection
         self = _read_object(fp)
         _, self.fds, _, _ = socket.recv_fds(conn, 10, maxfds=5)
-        if self.master is not None:
-            self.master = self.fds[3]
-            self.slave = self.fds[4]
+        if self.slave is not None:
+            self.slave = self.fds[3]
             self.fds = self.fds[:3]
         return self
 
@@ -752,6 +783,7 @@ class Client:
             # if we receive something here, means the worker has returned
             # control to the shell (the sentry).
             event, data = _read_object(control_fp)
+            debug(f"received event from worker[{remote_pid}] ({event=}, {data=})")
 
             if term:
                 # FIXME: what happens here if we're in the 
@@ -762,15 +794,23 @@ class Client:
                 exitstatus = data
                 return exitstatus
             elif event == "stopped":
+                debug("sending SIGSTOP to own process group")
                 os.kill(0, signal.SIGSTOP)
 
                 # this is where we sleep....
                 # ... and continue when we're awoken by SIGCONT (e.g., 'fg' in the shell)
+                debug("received SIGCONT")
 
                 if term:
                     term.setraw()
                     term.syncwinsize()
                     term.resume()
+
+                # # resume our own process group (tty proxy, any pipes we were
+                # # a part of).
+                # NOTE: Commented out as the shell should do this for us in
+                # normal operation.
+                # os.killpg(0, signal.SIGCONT)
 
                 # wake up the worker
                 os.killpg(os.getpgid(remote_pid), signal.SIGCONT)
@@ -791,8 +831,9 @@ class Client:
             # or terminating itself, we'll be told about it via
             # the control socket (and can do the same).
             #
-            # FIXME: this signaling should be done through the control socket (pid race contitions!)
-            # debug(f"_handle_ISIG: {signum=}")
+            debug(f"received signal {signum}, forwarding to worker[{remote_pid}]")
+            # FIXME: we always forward all signals to the worker's process
+            # group. It's not clear if this is the right thing to do in general.
             os.killpg(os.getpgid(remote_pid), signum)
 
         # forward all signals that make sense to forward
@@ -824,11 +865,11 @@ class Client:
 
         # the pty and runspec
         term, slave = Terminal.construct()
-        rs = RunSpec.construct(term.master, slave)
+        rs = RunSpec.construct(slave)
         rs.write(server, fp)
-        if term:
+        if slave:
             os.close(slave)
-            term.run()
+            term.run(close_fds=[fp.fileno()])
 
         # get the worker PID
         worker_pid = _read_object(fp)
@@ -921,8 +962,7 @@ if not _disabled:
     _setup_logging()
     import atexit
     def _logexit():
-        _logfile.write("exited\n")
-        _logfile.flush()
+        debug("atexit")
     atexit.register(_logexit)
     debug(f"started: {sys.argv}")
     _server = _connect_or_serve()
