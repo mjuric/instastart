@@ -30,7 +30,8 @@
             "console": "integratedTerminal",
             "subProcess": true,
             "env": {
-                "INSTA_LOG": "insta.log"
+                "INSTA_LOG": "insta.log",
+                "INSTA_TIMEOUT": "0"
             }
             //            "args": [ ">", "foo.log", "2>&1", "<", "/dev/null" ]
         }

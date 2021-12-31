@@ -180,9 +180,9 @@ def main(notty=False):
 
     cmd_info()
 
-    catchable_sigs = set(signal.Signals) - {signal.SIGKILL, signal.SIGSTOP}
-    for sig in catchable_sigs:
-        signal.signal(sig, _on_signal)  # Substitute handler of choice for `print`
+    # catchable_sigs = set(signal.Signals) - {signal.SIGKILL, signal.SIGSTOP}
+    # for sig in catchable_sigs:
+    #     signal.signal(sig, _on_signal)  # Substitute handler of choice for `print`
 
     while True:
         os.write(1, b"> ")

@@ -274,3 +274,13 @@ def test_reopen_tty(env):
                     if line == s + "\n": break
                 else:
                     assert False, f"'{s}' not found in output."
+
+# TODO: tests to write
+# - test running in the background
+# - test window size changes
+# - run w/o a tty
+# - test HUP on client's tty
+# - run w/o INSTA_PID_DIR set
+# - test server timeout
+# - test connect on already existing server
+# - test incorrectly set INSTA_DISABLE variable
