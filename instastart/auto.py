@@ -1,8 +1,9 @@
 # FIXME:
 #  * Do we need to block/unblock signals in signal handlers?
 #  * Sane default for systems w/o XDG_RUNTIME_DIR (macOS)
-#  * Proper logging
-#  * Tests
+#  * Forward signal handlers (e.g., so nohup works)
+#  * Forward open file handles
+#  * Detect when the client has been SIGSTOPped 
 #
 from errno import EINTR
 import socket, os, sys, pickle, tty, fcntl, termios, select, signal, inspect, hashlib
@@ -850,6 +851,70 @@ def _run_coverage_py_atexit(): #pragma: no cover
 
     return None
 
+import errno
+def _tty_read(fd, buffer, maxbuf):
+    # returns (buffer, status) where status can be 
+    # one of EINTR, EWOULDBLOCK, EIO
+    try:
+        data = os.read(fd, maxbuf - len(buffer))
+        if not data: # end of file on macOS
+            raise OSError
+        buffer += data
+        status = 0
+    except BlockingIOError: # no new data available
+        status = errno.EWOULDBLOCK
+    except InterruptedError: # interrupted by SIGTTIN
+        status = errno.EINTR
+    except OSError: # end of file on Linux
+        status = errno.EIO
+
+    return buffer, status
+
+def _tty_write(fd, buffer):
+    try:
+        n = os.write(fd, buffer)
+        buffer = buffer[n:]
+        status = 0
+    except BlockingIOError: # not ready to write
+        status = errno.EWOULDBLOCK
+    except InterruptedError: # interrupted by SIGTTOU
+        status = errno.EINTR
+    except OSError: # pty closed
+        status = errno.EIO
+
+    return buffer, status
+
+def _copy_tty_to_tty(srcfd, destfd, maxbuf, buffer=''):
+    # robustly copy up to maxread bytes between two non-blocking tty
+    # descriptors. if we read some data and destfd write would block, return
+    # the bytes remaining to be written.
+    intr_fds = {}
+    closed_fds = {}
+
+    # try read
+    try:
+        buffer += os.read(srcfd, maxbuf - len(buffer))
+    except BlockingIOError:
+        pass
+    except InterruptedError: # interrupted by SIGTTIN
+        intr_fds = { srcfd }
+    except OSError: # end of file on Linux
+        buffer = b""
+
+    # try write
+    if buffer:
+        try:
+            n = os.write(destfd, buffer)
+            buffer = buffer[n:]
+        except BlockingIOError:
+            pass
+        except InterruptedError: # interrupted by SIGTTOU
+            intr_fds = { destfd }
+        except OSError:
+            closed_fds = { destfd }
+
+    return buffer, closed_fds, intr_fds
+
 class Client:
     socket_path = None   # path to the UNIX socket we connect to
 
@@ -871,14 +936,21 @@ class Client:
         control_fd = control_fp.fileno()
         fds = { control_fd, sig_r }
         if term:
+            os.set_blocking(term.master, False)
+            os.set_blocking(term.tty, False)
+
             fds |= { term.master, term.tty}
             open_tty = { term.tty }
 
-        # enter the control loop
+        # the control loop polls for a) received signals, b) events from the
+        # sentry/worker, c) tty input and d) pty output.
         FG_CHECK_INTERVAL=0.1
+        MAXREAD = 1024*1024
         pgrp = os.getpgrp()
         timeout = None
-        while fds:
+        out_buffer = b''
+        in_buffer = b''
+        while True:
             rfds, _, _ = select.select(fds, [], [], timeout)
 
             if timeout is not None and not rfds:
@@ -890,9 +962,10 @@ class Client:
 
             # consume received signals
             if sig_r in rfds:
-                signums = bytearray(os.read(sig_r, 1024*1024))
+                signums = bytearray(os.read(sig_r, MAXREAD))
                 debug(f"received signals {[_signame(s) for s in signums]}")
                 for signum in signums:
+                    fwd = False
                     if signum == signal.SIGCONT:
                         # message the sentry to continue the worker
                         debug("handling SIGCONT")
@@ -909,7 +982,29 @@ class Client:
 
                         # wake up the worker
                         _write_object(control_fp, ("cont", fg))
+                    elif signum == signal.SIGHUP and term:
+                        # we got this because either the client's tty was
+                        # closed, or a SIGHUP was sent explicitly. Try to
+                        # differentiate between the two by testing if the
+                        # client's tty is still valid.
+                        _, err = _tty_write(term.tty, b'')
+                        if err == errno.EIO:
+                            # the client's tty got closed. Close the worker's
+                            # pty, triggering a sentry exit, which will
+                            # trigger the SIGHUP to the worker (as the sentry
+                            # is the pty's session leader).
+                            os.close(term.master)
+                            os.close(term.tty)
+                            fds -= { term.master, term.tty }
+                            term = None
+                            continue
+                        else:
+                            # we were SIGHUP-ed directly; just forward them
+                            fwd = True
                     else:
+                        fwd = True
+
+                    if fwd:
                         # forward all other signals.
                         debug(f"forwarding {_signame(signum)} to worker[{self.worker_pid}]")
                         os.killpg(os.getpgid(self.worker_pid), signum)
@@ -918,8 +1013,12 @@ class Client:
             if control_fd in rfds:
                 # control messages from the sentry.
                 # FIXME: if the sentry dies a violent death, control_fp will get
-                # closed and the read will raise an error here. How should we handle it?
-                event, data = _read_object(control_fp)
+                # closed and the read will raise an error here. How should we
+                # handle it?
+                try:
+                    event, data = _read_object(control_fp)
+                except EOFError:
+                    event, data = "died", None
                 debug(f"received event from worker[{self.worker_pid}] ({event=}, {data=})")
 
                 # if we receive something here, means the worker has returned
@@ -932,79 +1031,112 @@ class Client:
                     os.kill(0, signal.SIGSTOP)
                     continue
                 else:
-                    assert event in {"exited", "signaled"}, f"unknown control event {event=}"
-
-                    # the worker's dead. leave a backgrounded "ghost" behind to take care of the
-                    # tty<->pty forwarding.
-                    if term and term.master in fds:
-                        if _fork("tty") == 0:
-                            # child process -- have it only listen for the
-                            # worker's _output_.
-                            fds = { term.master }
-                            timeout = None
-                            continue # go back to select()
-
-                    if event == "exited":
-                        exitstatus = data
-                        return exitstatus
-                    elif event == "signaled":
-                        # commit copycat suicide
-                        signum = data
-                        signal.signal(signum, signal.SIG_DFL)
-                        _run_coverage_py_atexit()
-                        os.kill(os.getpid(), signum) #pragma: no cover
+                    # the worker's exited; exit the control loop
+                    break
 
             if term:
-                # consume the output from the worker
+                # consume the worker's stdout
                 if term.master in rfds:
-                    try:
-                        data = os.read(term.master, 1024*1024)
-                    except OSError:
-                        data = b""
-
-                    if not data:
-                        # No one listening on the slave end of the pty any more.
-                        # We can stop listening, as there'll be nothing more to forward.
-                        # Note: on Linux, once the last slave fd is closed,
-                        # trying to reopen it with open(/dev/tty) doesn't seem to
-                        # work -- the open succeeds, writes succeed, but nothing
-                        # is forwarded back to the master.
-                        debug("pty slave closed. exiting.")
+                    out_buffer, err = _tty_read(term.master, out_buffer, MAXREAD)
+                    if err == errno.EIO:
+                        # No has the slave end of the pty open any more. We
+                        # can stop listening, as there'll be nothing more to
+                        # forward. Note: on Linux, once the last slave fd is
+                        # closed, trying to reopen it with open(/dev/tty)
+                        # doesn't seem to work -- the open succeeds, writes
+                        # succeed, but nothing is forwarded back to the
+                        # master.
+                        debug("pty slave closed.")
                         fds -= { term.master }
 
-                    # FIXME: we should handle a SIGTTOU here if `stty tostop` is set
-                    _writen(term.tty, data)
-
-                # consume and forward the client's stdin
+                # consume the client's stdin
                 if term.tty in rfds:
-                    try:
-                        data = os.read(term.tty, 1024*1024)
-                    except BlockingIOError:
-                        # there's nothing to read after all. this can happen
-                        # if something else consumed the tty input between
-                        # the select() returning and us attempting the read()
-                        # (e.g., we were SIGSTOP-ed and then continued).
-                        pass
-                    except InterruptedError:
+                    in_buffer, err = _tty_read(term.tty, in_buffer, MAXREAD)
+                    if err == errno.EINTR:
                         # This is due to SIGTTIN; we've been backgrounded.
                         # Send us a SIGCONT to internalize the new state of things.
                         os.kill(os.getpid(), signal.SIGCONT)
-                    except OSError:
-                        data = b""
-
-                    if not data:
+                    elif err == errno.EIO:
                         # our tty got closed; we should exit (and will probably
                         # receive a SIGHUP anyway)
+                        # FIXME: should SIGHUP be handled? e.g., should we
+                        # close the pty?
                         debug("tty (stdin) closed.")
                         fds -= open_tty
                         open_tty = {}
 
-                    # FIXME: could we deadlock here if the master blocks?
-                    _writen(term.master, data)
+                # produce to the worker's stdin
+                in_buffer, err = _tty_write(term.master, in_buffer)
+                if err == errno.EIO:
+                    debug("pty slave closed. exiting.")
+                    fds -= { term.master }
 
-        # the only way to exit the while loop is in the tty "ghost" process
-        assert _name == "tty"
-        return 0
+                # produce to the client's stout
+                out_buffer, err = _tty_write(term.tty, out_buffer)
+                if err == errno.EIO:
+                    debug("client tty closed. exiting.")
+                    fds -= { term.tty }
+
+        # the worker is dead or exited. we need to drain the stdout,
+        # and then leave behind a try "ghost" process to continue consuming
+        # the stdout until its closed (i.e., by all worker's children exiting).
+        assert event in {"exited", "signaled"}, f"unknown control event {event=}"
+
+        # stop forwarding signals to the worker
+        # FIXME: we'd need to restore these to the original signals, but
+        # Python gives us no way to capture/reinstall signals installed by
+        # non-Python code (e.g., utilities like `nohup`)
+        # FIXME: it can still be made to work for SIG_IGN
+        # FIXME: we should also forward the signal handlers to the worker
+        # (e.g., at least the SIG_IGN/SIG_DFL ones, as Python won't let us
+        # get to non-python signal handlers)
+        for signum in fwd_signals:
+            signal.signal(signum, signal.SIG_DFL)
+
+        # drain the pty output. we count it as drained when there's nothing
+        # more left to read, when we reach MAXREAD, or when it's closed.
+        if term and term.master in fds and open_tty:
+            err = 0
+            while not err and len(out_buffer) < MAXREAD:
+                out_buffer, err = _tty_read(term.master, out_buffer, MAXREAD)
+
+            err = 0
+            while not err and len(out_buffer):
+                out_buffer, err = _tty_write(term.tty, out_buffer)
+
+            # leave a backgrounded process behind to take care of the
+            # residual tty<->pty forwarding.
+            if _fork("tty") == 0:
+                _setproctitle(f"[{' '.join(sys.argv)} :: tty/{os.getpid()}]")
+
+                os.set_blocking(term.master, True)
+                os.set_blocking(term.tty, True)
+                while True:
+                    out_buffer, err = _tty_read(term.master, out_buffer, MAXREAD)
+                    if err == errno.EIO and not out_buffer:
+                        # worker's pty is closed and there's nothing
+                        # remaining to be written to the client's tty.
+                        break;
+
+                    out_buffer, err = _tty_write(term.tty, out_buffer)
+                    if err:
+                        break
+
+                return 0
+
+        # handle the exit
+        if event == "exited":
+            exitstatus = data
+            return exitstatus
+        elif event == "signaled":
+            # commit copycat suicide
+            signum = data
+            signal.signal(signum, signal.SIG_DFL)
+            _run_coverage_py_atexit()
+            os.kill(os.getpid(), signum) #pragma: no cover
+
+        # we should never get to here
+        assert False
 
     def connect(self):
         # try connecting to the UNIX socket. If successful, pass it our command
