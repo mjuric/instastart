@@ -15,11 +15,19 @@
             "type": "python",
             "request": "launch",
             "module": "pytest",
+//            "program": "/epyc/ssd/users/mjuric/miniconda3/envs/lsd2/bin/pytest",
             "args": [
                 "--no-cov",
-                "tests/test_simple.py::test_reopen_tty"
+                "tests/test_simple.py::test_intr[Signals.SIGKILL]"
             ],
-            "cwd": "${workspaceFolder}"
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "subProcess": true,
+            "env": {
+                "INSTA_TEST_PEXPECT_TIMEOUT": "0",
+                "INSTA_LOG": "insta.log",
+                "INSTA_TIMEOUT": "0"
+            }
         },
         {
             "name": "Python: instatest",

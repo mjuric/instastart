@@ -161,7 +161,7 @@ def wait_for(procs, states, timeout):
         states = set(states)    # for performance
 
     t0 = time.time()
-    while time.time() - t0 < timeout:
+    while timeout is None or time.time() - t0 < timeout:
         for proc in procs:
             try:
                 status = proc.status()
@@ -180,8 +180,12 @@ def wait_for(procs, states, timeout):
 def test_suspend_resume(env):
     with in_scripts_dir():
         with wait_all(env) as env:
+            timeout = int(os.getenv("INSTA_TEST_PEXPECT_TIMEOUT", 1))
+            if timeout <= 0: timeout = None
+
             # spin up a client + worker
-            p = pexpect.spawn(f"./pidwait {sys.executable} echo.py", env=env, encoding='utf-8', timeout=1)
+            p = pexpect.spawn(f"./pidwait {sys.executable} echo.py", env=env, encoding='utf-8', timeout=timeout)
+#            p = pexpect.spawn(f"{sys.executable} echo.py", env=env, encoding='utf-8', timeout=timeout)
             p.expect_exact("> ")
 
             client, worker = get_pids(env["INSTA_PID_DIR"], "client", "worker")
@@ -191,12 +195,15 @@ def test_suspend_resume(env):
             p.sendcontrol('z')
 
             # verify that both the client and the worker went to sleep
-            wait_for([pcli, pwrk], ['stopped'], timeout=1.)
+            wait_for([pcli, pwrk], ['stopped'], timeout=timeout)
+
+            # verify we got "^Z" on output
+            p.expect_exact("^Z")
 
             # resume and verify they both woke up (transitioned to 'sleeping'
             # state)
             os.killpg(os.getpgid(client), signal.SIGCONT)
-            wait_for([pcli, pwrk], ['sleeping'], timeout=1.)
+            wait_for([pcli, pwrk], ['sleeping'], timeout=timeout)
 
             # make sure everything still works
             p.sendline("Hello")
@@ -214,6 +221,7 @@ def test_intr(env, signum):
         with wait_all(env) as env:
             # spin up a client + worker
             p = pexpect.spawn(f"./pidwait {sys.executable} echo.py", env=env, encoding='utf-8')
+#            p = pexpect.spawn(f"{sys.executable} echo.py", env=env, encoding='utf-8')
             p.expect_exact("> ")
 
             client, worker = get_pids(env["INSTA_PID_DIR"], "client", "worker")

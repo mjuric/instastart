@@ -145,13 +145,13 @@ def _write_object(fp, obj):
     """ Write an object to file fp, using pickle """
     return pickle.dump(obj, fp, -1)
 
-def _writen(fd, data):
-    """Write all the data to a descriptor."""
-    while data:
-        n = os.write(fd, data)
-        data = data[n:]
-
 if False:
+    def _writen(fd, data):
+        """Write all the data to a descriptor."""
+        while data:
+            n = os.write(fd, data)
+            data = data[n:]
+
     def _readn(fd, n):
         """Read n bytes from a file descriptor."""
         s = os.read(fd, n)
@@ -463,7 +463,7 @@ class Worker:
             # ENOTTY=25 (?!))
             signal.signal(signal.SIGTTOU, signal.SIG_IGN)
 
-            sig_r, sig_w = _signal_via_pipe(signal.SIGCHLD)
+            sig_r, sig_w = _signal_via_pipe(signal.SIGCHLD, signal.SIGHUP)
 
             os.setpgid(pid, pid)        # start a new process group for the child
             if rs.slave is not None:
@@ -478,15 +478,18 @@ class Worker:
 
             try:
                 self._sentry_loop(fp, sig_r, wrk_r, pid)
+            except BaseException as e:
+                # print out the exception (which will end up in the log file)
+                import traceback
+                traceback.print_exc(file=sys.stderr)
+                raise
             finally:
                 conn.close()
                 os.close(sig_r)
                 os.close(sig_w)
-                # FIXME: this should really be os._exit(), otherwise
-                # except/finally branches may be triggered in the user's
-                # code. Keeping sys.exit() for now as coverage.py needs to
-                # run atexit handlers.
-                sys.exit(0)
+
+                _run_coverage_py_atexit()
+                os._exit(0)
 
         assert False, "We should never exit this function" 
 
@@ -504,13 +507,14 @@ class Worker:
         worker_done = False # did the worker "exit" via a call to done()
         while fds:
             rfds, _, _ = select.select(fds, [], [])
+            debug(f"{fds=} {rfds=}")
 
             if client_fd in rfds:
                 # a command from the client (or note of the client's death)
                 try:
                     (cmd, args) = _read_object(client_fp)
                 except EOFError:
-                    cmd = "died"
+                    cmd, args = "died", None
                 debug(f"received command {cmd=} {args=}")
 
                 if cmd == "died":
@@ -518,14 +522,17 @@ class Worker:
                     if not worker_done:
                         debug(f"detected that the client has died. killing worker.")
                         os.killpg(os.getpgid(pid), signal.SIGKILL)
+                        debug(f"killing self with SIGKILL")
+                        _run_coverage_py_atexit()
+                        os.kill(0, signal.SIGKILL) #pragma: no cover
                 elif cmd == "cont":
                     # continue the process
                     fg = args
-                    assert isinstance(fg, bool)
                     if self.tty is not None:
-                        fg_pgid = os.getpgid(pid if args == "fg" else 0)
+                        fg_pgid = os.getpgid(pid if fg else 0)
                         os.tcsetpgrp(self.tty, fg_pgid)
-                        debug(f"set {fg_pgid=} into foreground.")
+                        debug(f"set {'worker' if fg else 'sentry'} into foreground ({fg_pgid=}).")
+                    debug(f"sending SIGCONT to worker.")
                     os.killpg(os.getpgid(pid), signal.SIGCONT)
                 else: #pragma: no cover
                     assert False, f"Unknown command {cmd=}"
@@ -555,37 +562,42 @@ class Worker:
 
             if sig_r in rfds:
                 # empty the buffer (we only use this for signaling on the child)
-                os.read(sig_r, 1024*1024)
+                signums = bytearray(os.read(sig_r, 1024*1024))
+                debug(f"received signals {[_signame(s) for s in signums]}")
+                for signum in signums:
+                    if signum == signal.SIGHUP:
+                        # the master end of the pty hung up
+                        continue
+                    elif signum == signal.SIGCHLD:
+                        # wait for child status
+                        _, status = os.waitpid(pid, os.WUNTRACED | os.WCONTINUED)
+                        debug(f"waitpid({pid}) returned {status=} ({worker_done=})")
+                        if worker_done:
+                            return
 
-                # wait for child status
-                _, status = os.waitpid(pid, os.WUNTRACED | os.WCONTINUED)
-                debug(f"waitpid({pid}) returned {status=} ({worker_done=})")
-                if worker_done:
-                    break
-
-                if os.WIFSTOPPED(status):
-                    # let the controller know we've stopped
-                    debug(f"worker stopped")
-                    if self.tty is not None:
-                        # make the sentry the foreground process
-                        debug(f"moving sentry to foreground")
-                        os.tcsetpgrp(self.tty, os.getpgid(0))
-                    _write_object(client_fp, ("stopped", 0))
-                elif os.WIFCONTINUED(status):
-                    # nothing to do here, just informational
-                    debug(f"worker continued (SIGCONT)")
-                elif os.WIFEXITED(status):
-                    # we've exited. return the status back to the controller
-                    debug(f"worker exited, exitstatus={os.WEXITSTATUS(status)}")
-                    _write_object(client_fp, ("exited", os.WEXITSTATUS(status)))
-                    break
-                elif os.WIFSIGNALED(status):
-                    # we've exited. return the status back to the controller
-                    debug(f"worker terminated with signal {os.WTERMSIG(status)}")
-                    _write_object(client_fp, ("signaled", os.WTERMSIG(status)))
-                    break
-                else:
-                    assert False, f"weird {status=}" #pragma: no cover
+                        if os.WIFSTOPPED(status):
+                            # let the controller know we've stopped
+                            debug(f"worker stopped")
+                            if self.tty is not None:
+                                # make the sentry the foreground process
+                                debug(f"moving sentry to foreground")
+                                os.tcsetpgrp(self.tty, os.getpgid(0))
+                            _write_object(client_fp, ("stopped", 0))
+                        elif os.WIFCONTINUED(status):
+                            # nothing to do here, just informational
+                            debug(f"worker continued (SIGCONT)")
+                        elif os.WIFEXITED(status):
+                            # we've exited. return the status back to the controller
+                            debug(f"worker exited, exitstatus={os.WEXITSTATUS(status)}")
+                            _write_object(client_fp, ("exited", os.WEXITSTATUS(status)))
+                            return
+                        elif os.WIFSIGNALED(status):
+                            # we've exited. return the status back to the controller
+                            debug(f"worker terminated with {_signame(os.WTERMSIG(status))}")
+                            _write_object(client_fp, ("signaled", os.WTERMSIG(status)))
+                            return
+                        else:
+                            assert False, f"weird {status=}" #pragma: no cover
 
 #############################################################################
 #
@@ -635,94 +647,9 @@ class Terminal:
 
         return Terminal(tty, master, attr), slave
 
-    def run(self, close_fds=[]):
-        client_pid = os.getpid()
-
-        self.pid = _fork("tty")
-        if self.pid == 0:
-            for fd in close_fds:
-                os.close(fd)
-
-            # set up a SIGCONT handler to catch background/foreground
-            # transitions
-            def _on_sigcont(signum, frame):
-                debug("caught SIGCONT")
-                self.fg = os.tcgetpgrp(self.tty) == os.getpgrp()
-                debug(f"running in the {'foreground' if self.fg else 'background'}")
-            signal.signal(signal.SIGCONT, _on_sigcont)
-
-            # pty proxy process
-            try:
-                _setproctitle(f"[{' '.join(sys.argv)} :: tty/{client_pid}]")
-                self._tty_proxy_loop()
-            except:
-                import traceback
-                traceback.print_exc(file=sys.stderr)
-                raise
-            finally:
-                # ensure we never hit end-user code
-                _run_coverage_py_atexit()
-                debug("tty exiting")
-                os._exit(0)  #pragma: no cover
-
-    def _tty_proxy_loop(self):
-        while True:
-            if self.fg:
-                fds = [ self.master, self.tty ]
-            else:
-                fds = [ self.master ]
-
-            rfds, _wfds, _xfds = select.select(fds, [], [])
-            # debug(f"{self.master=} {self.tty=} {fds=} {rfds=}")
-
-            if self.master in rfds:
-                try:
-                    data = os.read(self.master, 1024*1024)
-                except OSError:
-                    data = b""
-
-                if not data:
-                    # No one listening on the slave end of the pty any more.
-                    # We can exit, as there'll be nothing more to forward.
-                    # Note: on Linux, once the last slave fd is closed,
-                    # trying to reopen it with open(/dev/tty) doesn't seem to
-                    # work -- the open succeeds, writes succeed, but nothing
-                    # is forwarded back to the master.
-                    debug("pty slave closed. exiting.")
-                    break
-
-                _writen(self.tty, data)
-
-            if self.tty in rfds:
-                if not self.fg:
-                    # FIXME: this is a hack around being backgrounded between
-                    # input becoming available on tty and this point in the
-                    # code. It does not fully resolve the problem, as we
-                    # could still be backgrounded between here and os.read().
-                    # A proper fix is to handle SIGTTIN (both here an in the
-                    # client process, as it will be sent to the entire
-                    # process group).
-                    continue
-
-                try:
-                    data = os.read(self.tty, 1024*1024)
-                except OSError:
-                    data = b""
-
-                if not data:
-                    # our tty got closed; we should exit (and will probably
-                    # receive a SIGHUP anyway)
-                    debug("tty (stdin) closed. exiting.")
-                    break
-
-                _writen(self.master, data)
-
-    def __del__(self):
-        os.close(self.tty)
-        os.close(self.master)
-
-    def resume(self):
-        os.kill(self.pid, signal.SIGCONT)
+    # def __del__(self):
+    #     os.close(self.tty)
+    #     os.close(self.master)
 
     def syncwinsize(self):
         _setwinsize(self.master, _getwinsize(self.tty))
@@ -884,37 +811,6 @@ def _tty_write(fd, buffer):
 
     return buffer, status
 
-def _copy_tty_to_tty(srcfd, destfd, maxbuf, buffer=''):
-    # robustly copy up to maxread bytes between two non-blocking tty
-    # descriptors. if we read some data and destfd write would block, return
-    # the bytes remaining to be written.
-    intr_fds = {}
-    closed_fds = {}
-
-    # try read
-    try:
-        buffer += os.read(srcfd, maxbuf - len(buffer))
-    except BlockingIOError:
-        pass
-    except InterruptedError: # interrupted by SIGTTIN
-        intr_fds = { srcfd }
-    except OSError: # end of file on Linux
-        buffer = b""
-
-    # try write
-    if buffer:
-        try:
-            n = os.write(destfd, buffer)
-            buffer = buffer[n:]
-        except BlockingIOError:
-            pass
-        except InterruptedError: # interrupted by SIGTTOU
-            intr_fds = { destfd }
-        except OSError:
-            closed_fds = { destfd }
-
-    return buffer, closed_fds, intr_fds
-
 class Client:
     socket_path = None   # path to the UNIX socket we connect to
 
@@ -974,7 +870,7 @@ class Client:
                             term.syncwinsize()
                             fg = term.try_setraw()
                             if fg:
-                                fds += open_tty
+                                fds |= open_tty
                             else:
                                 fds -= open_tty
                                 rfds -= open_tty
@@ -1022,8 +918,30 @@ class Client:
                 debug(f"received event from worker[{self.worker_pid}] ({event=}, {data=})")
 
                 # if we receive something here, means the worker has returned
-                # control to the shell (the sentry). restore the terminal.
-                if term:
+                # control to the shell (the sentry). drain the pty output. we
+                # count it as drained when there's nothing more left to read,
+                # when we reach MAXREAD, or when it's closed.
+                if term and term.master in fds and open_tty:
+                    err = 0
+                    while not err and len(out_buffer) < MAXREAD:
+                        out_buffer, err = _tty_read(term.master, out_buffer, MAXREAD)
+                    if err == errno.EIO:
+                        debug("pty slave closed.")
+                        fds -= { term.master }
+
+                    err = 0
+                    while not err and len(out_buffer):
+                        out_buffer, err = _tty_write(term.tty, out_buffer)
+                    if err == errno.EIO:
+                        debug("client tty (output) closed.")
+                        fds -= { term.tty }
+                    elif err == errno.EINTR:
+                        # this means we were backgrounded, and stty tostop is
+                        # on. we don't have to do anything special as we'll
+                        # either exit or be stopped in the next few lines.
+                        pass
+
+                    # restore the terminal.
                     term.try_reset()
 
                 if event == "stopped":
@@ -1095,36 +1013,31 @@ class Client:
 
         # drain the pty output. we count it as drained when there's nothing
         # more left to read, when we reach MAXREAD, or when it's closed.
-        if term and term.master in fds and open_tty:
-            err = 0
-            while not err and len(out_buffer) < MAXREAD:
-                out_buffer, err = _tty_read(term.master, out_buffer, MAXREAD)
+        if term:
+            if term.master in fds and open_tty:
+                # leave a backgrounded process behind to take care of the
+                # residual tty<->pty forwarding.
+                if _fork("tty") == 0:
+                    _setproctitle(f"[{' '.join(sys.argv)} :: tty/{os.getpid()}]")
 
-            err = 0
-            while not err and len(out_buffer):
-                out_buffer, err = _tty_write(term.tty, out_buffer)
+                    os.set_blocking(term.master, True)
+                    os.set_blocking(term.tty, True)
+                    while True:
+                        out_buffer, err = _tty_read(term.master, out_buffer, MAXREAD)
+                        if err == errno.EIO and not out_buffer:
+                            # worker's pty is closed and there's nothing
+                            # remaining to be written to the client's tty.
+                            break;
 
-            # leave a backgrounded process behind to take care of the
-            # residual tty<->pty forwarding.
-            if _fork("tty") == 0:
-                _setproctitle(f"[{' '.join(sys.argv)} :: tty/{os.getpid()}]")
+                        out_buffer, err = _tty_write(term.tty, out_buffer)
+                        if err:
+                            break
 
-                os.set_blocking(term.master, True)
-                os.set_blocking(term.tty, True)
-                while True:
-                    out_buffer, err = _tty_read(term.master, out_buffer, MAXREAD)
-                    if err == errno.EIO and not out_buffer:
-                        # worker's pty is closed and there's nothing
-                        # remaining to be written to the client's tty.
-                        break;
+                    return 0
+            else:
+                debug(f"no need to fork tty as `{term.master in fds=}` and `{open_tty=}`")
 
-                    out_buffer, err = _tty_write(term.tty, out_buffer)
-                    if err:
-                        break
-
-                return 0
-
-        # handle the exit
+        # make the client exit in the same way as the worker
         if event == "exited":
             exitstatus = data
             return exitstatus
@@ -1135,7 +1048,7 @@ class Client:
             _run_coverage_py_atexit()
             os.kill(os.getpid(), signum) #pragma: no cover
 
-        # we should never get to here
+        # we should never get here
         assert False
 
     def connect(self):
