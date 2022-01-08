@@ -5,10 +5,23 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python: Attach using Process Id",
+            "name": "xonsh",
             "type": "python",
-            "request": "attach",
-            "processId": "${command:pickProcess}"
+            "request": "launch",
+//            "module": "pytest",
+            "program": "/epyc/ssd/users/mjuric/miniconda3/envs/lsd2/bin/xonsh",
+            "args": [
+                "-c",
+                "python y.py"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "subProcess": true,
+            "env": {
+                "INSTA_TEST_PEXPECT_TIMEOUT": "0",
+                "INSTA_LOG": "insta.log",
+                "INSTA_TIMEOUT": "0"
+            }
         },
         {
             "name": "Pytest",

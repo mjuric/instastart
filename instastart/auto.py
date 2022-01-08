@@ -8,6 +8,8 @@
 from errno import EINTR
 import socket, os, sys, pickle, tty, fcntl, termios, select, signal, inspect, hashlib
 from contextlib import contextmanager
+from .logging import TimestampedOutputFile, debug, _setup_logging, set_name
+from . import logging
 
 # Helpful constants
 STDIN  = 0
@@ -51,10 +53,6 @@ def _setproctitle(title):
 def _signame(signum):
     return next((sig.name for sig in signal.Signals if sig == signum), f"signal {signum}")
 
-# The name of this process, for logging ("tty", "worker", "server", "sentry",
-# "client"). Set by _fork(name).
-_name = "client"
-
 def _write_pid(name):
     if "INSTA_PID_DIR" not in os.environ:
         return
@@ -68,54 +66,13 @@ def _fork(name):
     if pid == 0:
         # fork, reset the child's name (for logging), and write out the child's
         # PID into a file in $INSTA_PID_DIR directory
-        global _name
-        _name = name
+        set_name(name)
 
         _write_pid(name)
     else:
         debug(f"forked {name}[{pid}]")
 
     return pid
-
-class TimestampedOutputFile:
-    out = None
-
-    def __init__(self, out):
-        self.out = out
-        self._at_line_start = True
-
-    def write(self, text):
-        import datetime
-        # add timestamps to beginnings of lines
-        ts = f'{datetime.datetime.now().strftime("%b %d %H:%M:%S.%f")} {_name:>6s}[{os.getpid()}] '
-
-        if self._at_line_start:
-            text = ts + text
-        lineend = text.endswith('\n')
-        text = text.replace('\n', "\n" + ts)
-        if lineend:
-            text = text[:-len(ts)]
-        self._at_line_start = lineend
-
-        self.out.write(text)
-
-    def __getattr__(self, name):
-        return getattr(self. out, name)
-
-def _setup_logging():
-    # log file must be inheritable across forks
-    fp = open(os.environ.get("INSTA_LOG", os.devnull), "a")
-    os.set_inheritable(fp.fileno(), True)
-
-    global _logfile
-    _logfile = TimestampedOutputFile(fp)
-
-def debug(*argv, **kwargs):
-    # our own fast-ish logging routines (importing logging seems to add
-    # ~15msec to runtime, tested on macOS/MBA)
-    kwargs['file'] = _logfile
-    kwargs['flush'] = True
-    return print(*argv, **kwargs)
 
 #############################################################################
 #   Pty management 
@@ -165,8 +122,8 @@ if False:
 
 def _redirect_stdin_stdout():
     # redirect all server output to the log file.
-    os.dup2(_logfile.out.fileno(), 1)
-    os.dup2(_logfile.out.fileno(), 2)
+    os.dup2(logging._logfile.out.fileno(), 1)
+    os.dup2(logging._logfile.out.fileno(), 2)
 
     # customize stdout/stderr to prepend timestamps
     sys.stdout = TimestampedOutputFile(sys.stdout)
@@ -679,6 +636,9 @@ class Terminal:
         try:
             self._setraw()
             self.fg = True
+        except InterruptedError as e:
+            assert str(e) == "interrupted by SIGTTOU."
+            self.fg = False
         except termios.error as e:
             import errno
             if e.args[0] != errno.EINTR:
@@ -873,7 +833,8 @@ class Client:
                                 fds |= open_tty
                             else:
                                 fds -= open_tty
-                                rfds -= open_tty
+                                if term.tty in rfds:
+                                    rfds.remove(term.tty)
                                 timeout = FG_CHECK_INTERVAL
 
                         # wake up the worker
