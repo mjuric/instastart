@@ -33,11 +33,13 @@ def set_name(name):
     global _name
     _name = name
 
-def _setup_logging(name="client"):
+def _setup_logging(name="client", logfile=None):
     set_name(name)
 
     # log file must be inheritable across forks
-    fp = open(os.environ.get("INSTA_LOG", os.devnull), "a")
+    if logfile is None:
+        logfile = os.environ.get("INSTA_LOG", os.devnull)
+    fp = open(logfile, "a")
     os.set_inheritable(fp.fileno(), True)
 
     global _logfile

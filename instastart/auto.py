@@ -625,11 +625,18 @@ class Terminal:
         # echoing happens it's impossible to reverse cleanly. This should
         # not be an issue in real life, but mostly with automated tools
         # such as pexpect.
+        try:
+            foo = os.read(self.tty, 1024)
+        except BlockingIOError: # no new data available
+            foo = "<empty>"
+        debug(f"foo: {foo}")
         tty.setraw(self.tty, termios.TCSAFLUSH)
+        debug("setraw: activated raw mode")
 
     def _reset(self):
         attr = termios.tcgetattr(self.master)
         termios.tcsetattr(self.tty, tty.TCSAFLUSH, attr)
+        debug("Terminal._reset: reset terminal")
 
     def try_setraw(self):
         self.fg = None
@@ -931,6 +938,7 @@ class Client:
                 # consume the client's stdin
                 if term.tty in rfds:
                     in_buffer, err = _tty_read(term.tty, in_buffer, MAXREAD)
+                    debug(f"in_buffer: {in_buffer}")
                     if err == errno.EINTR:
                         # This is due to SIGTTIN; we've been backgrounded.
                         # Send us a SIGCONT to internalize the new state of things.

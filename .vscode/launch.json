@@ -28,12 +28,12 @@
             "type": "python",
             "request": "launch",
             "module": "pytest",
-//            "program": "/epyc/ssd/users/mjuric/miniconda3/envs/lsd2/bin/pytest",
             "args": [
                 "--no-cov",
-                "tests/test_simple.py::test_intr[Signals.SIGKILL]"
+                "tests/test_simple.py::test_reopen_tty"
             ],
             "cwd": "${workspaceFolder}",
+            "justMyCode": false,
             "console": "integratedTerminal",
             "subProcess": true,
             "env": {

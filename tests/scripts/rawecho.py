@@ -7,6 +7,7 @@ if '--instastart' not in sys.argv:
     os.environ["INSTA_DISABLE"] = "yes"
 
 from instastart.auto import serve
+from instastart.logging import debug
 import os, time, sys, errno, signal, struct, fcntl, termios
 
 # unbuffered read of a line from stdin
@@ -192,6 +193,7 @@ def main(notty=False):
             # should only happen if 'close stdin' or 'close std' were invoked
             xprint("\nOSError: " + str(e))
             sys.exit(-1)
+        debug(f"received {data}")
         text = data.decode('utf-8')
 
         if text == "":
